@@ -116,3 +116,51 @@ class Decision:
     detail: str = ""
     auth_id: str | None = None
     args: PaymentArgs | None = None
+
+
+# ==========================================================================================
+# NÚCLEO UNIVERSAL (agnóstico al dominio): primitivos para cualquier ecosistema de agentes
+# que ejecutan herramientas. Los Policy Packs (firewall/packs/) los especializan por industria.
+# ==========================================================================================
+from enum import Enum as _Enum  # noqa: E402
+from typing import Literal as _Literal  # noqa: E402
+
+from pydantic import BaseModel as _BaseModel  # noqa: E402
+from pydantic import ConfigDict as _ConfigDict  # noqa: E402
+from pydantic import Field as _Field  # noqa: E402
+
+
+class NivelImpacto(str, _Enum):
+    """Clasificación de toda herramienta según el daño que puede causar si se invoca mal."""
+    LECTURA = "LECTURA"                            # consultar bases, logs, catálogos: sin fricción
+    MUTACION_MENOR = "MUTACION_MENOR"              # borradores, etiquetar tickets
+    COMUNICACION_EXTERNA = "COMUNICACION_EXTERNA"  # correos, webhooks o mensajes a terceros
+    CRITICA_IRREVERSIBLE = "CRITICA_IRREVERSIBLE"  # mover fondos, IAM, desplegar/borrar en prod, exportar datos
+
+
+class ToolManifest(_BaseModel):
+    """Declaración obligatoria de cada herramienta registrada en el ToolGateway."""
+    model_config = _ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    nombre: str
+    dominio: str
+    nivel_impacto: NivelImpacto
+    esquema_args: type[_BaseModel]
+    requiere_aprobacion_humana_si_tainted: bool = True
+    descripcion: str = ""
+
+
+CanalEnvelope = _Literal["email", "webhook_github", "ticket_soporte", "api_a2a", "interno"]
+
+
+class ContextEnvelope(_BaseModel):
+    """Sobre universal de cualquier entrada hacia un agente (correo, webhook, ticket, mensaje A2A)."""
+    model_config = _ConfigDict(extra="forbid", frozen=True)
+
+    canal: CanalEnvelope
+    remitente_o_actor: str = _Field(max_length=254)
+    asunto_o_titulo: str = _Field(max_length=300)
+    contenido_crudo: str = _Field(max_length=16000)
+    adjunto_o_payload: str | None = _Field(default=None, max_length=16000)
+    autenticacion_origen_valida: bool
+    iniciado_por: str | None = _Field(default=None, max_length=40)

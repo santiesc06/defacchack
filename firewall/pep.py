@@ -1,59 +1,40 @@
-"""Policy Enforcement Point — código determinista, sin LLM.
+"""Policy Enforcement Point — código determinista, sin LLM, agnóstico al dominio.
 
-Capa 1: intercepta cada invocación de herramienta del Agente Financiero y aplica la Matriz 3.
-Capa 2: gestiona las firmas humanas (Matriz 2: segregación de funciones, MFA, hash, vigencia) y
-        es el ÚNICO componente que puede ordenar un pago al servicio de pagos.
+Capa 1: intercepta cada invocación de herramienta del Agente Ejecutor y aplica, en este orden,
+        1) las reglas universales del núcleo `cfzt.pep.UniversalPEP` (U0–U3) y
+        2) las reglas del Policy Pack activo (pagos R1–R9, DevOps D1–D5).
+Capa 2: gestiona las firmas humanas (U4 segregación de funciones, MFA, hash de la acción, vigencia)
+        y es el ÚNICO componente que puede ordenar la ejecución al servicio del pack.
 
-Zero-trust interno: el PEP no confía en lo que dicen los agentes. Vuelve a consultar por sí mismo
-(solo lectura) el maestro, las OC y el historial, verifica el sello de las etiquetas del Sanitizer,
-y construye la orden de pago con los datos del MAESTRO, no con los del correo.
+Zero-trust interno: el PEP no confía en lo que dicen los agentes. El pack vuelve a consultar por sí
+mismo sus datos de referencia (maestro, catálogo), el núcleo verifica el sello de las etiquetas del
+Sanitizer, y la orden se construye con los datos verificados, no con los del correo o del issue.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable
 
-from pydantic import ValidationError
+from cfzt.pep import REGLAS_UNIVERSALES, UniversalPEP
 
 from .audit import AuditLogSHA256
-from .config import (DIAS_CUENTA_RECIENTE, DIAS_RESTRICCION_SOD_CAMBIO_CUENTA, ETIQUETA_ROL,
-                     HORAS_VIGENCIA_FIRMA, ROLES_QUE_PUEDEN_RECHAZAR, UMBRAL_ALTO_COP, UMBRAL_BAJO_COP, Rol,
-                     formato_cop)
-from .pagos import OrdenPago, PagoRechazado, ServicioPagosMock
-from .repositorio import Repositorio, normalizar_cuenta
+from .config import HORAS_VIGENCIA_FIRMA, ROLES_QUE_PUEDEN_RECHAZAR, Rol, etiqueta_rol
+from .packs.base import EjecucionRechazada, PolicyPack
 from .sanitizer import sellar
-from .schemas import (ESTADOS_PENDIENTES, Estado, Firma, MetadataSeguridadSchema, PropuestaPagoSchema,
-                      ReglaActivada, VeredictoPEP)
+from .schemas import ESTADOS_PENDIENTES, Estado, Firma, MetadataSeguridadSchema, ReglaActivada, VeredictoPEP
 
-# Matriz 1: herramientas que cada identidad no humana puede invocar a través del PEP.
-PERMISOS_HERRAMIENTAS: dict[str, frozenset[str]] = {
+# Compatibilidad: el pack de pagos conserva sus nombres históricos.
+from .packs.pagos_iso42001 import DESCRIPCION_REGLAS, RegistroPago, hash_transaccion  # noqa: E402,F401
+
+PERMISOS_HERRAMIENTAS = {  # Matriz 1 del pack de pagos (cada pack declara la suya en `permisos`)
     "agente:financiero": frozenset({"solicitar_ejecucion_pago"}),
-    "agente:recepcionista": frozenset(),
-    "agente:sanitizer": frozenset(),
-    "agente:orquestador": frozenset(),
-    "agente:explicador": frozenset(),
+    "agente:recepcionista": frozenset(), "agente:sanitizer": frozenset(),
+    "agente:orquestador": frozenset(), "agente:explicador": frozenset(),
 }
-
-DESCRIPCION_REGLAS = {
-    "R0": "Integridad de la invocación (herramienta permitida, argumentos válidos, etiquetas selladas)",
-    "R1": "Proveedor no registrado, o cuenta distinta a la del maestro",
-    "R2": "El Sanitizer marca riesgo ALTO",
-    "R3": "Falla SPF/DKIM/DMARC o dominio parecido/distinto al legítimo",
-    "R4": "Pago duplicado",
-    "R5": "Sin factura u orden de compra que lo respalde",
-    "R6": "Válido, riesgo bajo, hasta $2.000.000",
-    "R7": "Válido, riesgo medio o entre $2.000.000 y $20.000.000",
-    "R8": "Válido, más de $20.000.000",
-    "R9": "Cuenta del proveedor modificada en los últimos 30 días",
-}
-
-
-def hash_transaccion(proveedor_id: str | None, cuenta: str, monto: int) -> str:
-    return hashlib.sha256(f"{proveedor_id}|{normalizar_cuenta(cuenta)}|{monto}".encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -63,28 +44,7 @@ class ContextoPEP:
     metadata: MetadataSeguridadSchema
     sello_registrado: str
     iniciado_por: str | None = None
-
-
-@dataclass
-class RegistroPago:
-    solicitud_id: str
-    proveedor_id: str
-    razon_social: str
-    cuenta: str
-    monto_cop: int
-    numero_factura: str | None
-    numero_oc: str | None
-    concepto: str
-    hash_transaccion: str
-    firmas_requeridas: tuple[Rol, ...]
-    verificacion_telefonica_requerida: bool
-    telefono_registrado: str | None
-    iniciado_por: str | None
-    creado: datetime
-    estado: Estado = Estado.PENDIENTE_FIRMA_1
-    firmas: list[Firma] = field(default_factory=list)
-    verificacion_telefonica_hecha: bool = False
-    pago: dict | None = None
+    correo: object | None = None  # solo lo usa el verificador del modo SOLO_LLM; el PEP lo ignora
 
 
 class ErrorFirma(Exception):
@@ -92,19 +52,25 @@ class ErrorFirma(Exception):
 
 
 class PolicyEnforcementPoint:
-    def __init__(self, repositorio: Repositorio, pagos: ServicioPagosMock, audit: AuditLogSHA256,
-                 reloj: Callable[[], datetime]) -> None:
-        self._repo = repositorio
-        self._vista = repositorio.vista_solo_lectura()
-        self._pagos = pagos
-        self._llave = pagos.emitir_llave_pep()  # único emisor de órdenes de pago
+    def __init__(self, pack: PolicyPack, audit: AuditLogSHA256, reloj: Callable[[], datetime]) -> None:
+        self.pack = pack
+        self.core = UniversalPEP(pack.id, pack.permisos, pack.manifiestos)
+        self._directorio = pack.directorio
+        self._servicio = pack.servicio_ejecucion
+        self._llave = self._servicio.emitir_llave_pep()  # único emisor de órdenes de ejecución
         self._audit = audit
         self._reloj = reloj
-        self.registros: dict[str, RegistroPago] = {}
+        self.registros: dict = {}
         self.estados_finales: dict[str, Estado] = {}
 
+    def _codigo(self, codigo: str) -> str:
+        return self.pack.etiqueta(codigo)
+
+    def _descripcion(self, codigo: str) -> str:
+        return self.pack.descripcion_reglas.get(codigo) or REGLAS_UNIVERSALES.get(codigo, codigo)
+
     # ====================================================================================
-    # Capa 1 — motor de reglas (Matriz 3)
+    # Capa 1 — núcleo universal + reglas del pack
     # ====================================================================================
     def evaluar(self, agente: str, herramienta: str, args: dict, ctx: ContextoPEP) -> VeredictoPEP:
         t0 = time.perf_counter()
@@ -113,9 +79,10 @@ class PolicyEnforcementPoint:
         self.estados_finales[ctx.solicitud_id] = veredicto.estado
         self._audit.anexar(actor="pep", evento="DECISION_PEP", solicitud_id=ctx.solicitud_id,
                            estado=veredicto.estado.value,
-                           payload={"decision": veredicto.decision, "regla_principal": veredicto.regla_principal,
+                           payload={"dominio": self.pack.id, "decision": veredicto.decision,
+                                    "regla_principal": veredicto.regla_principal,
                                     "reglas": [r.codigo for r in veredicto.reglas],
-                                    "firmas_requeridas": [r.value for r in veredicto.firmas_requeridas],
+                                    "firmas_requeridas": [str(r) for r in veredicto.firmas_requeridas],
                                     "hash_transaccion": veredicto.hash_transaccion,
                                     "alerta_seguridad": veredicto.alerta_seguridad})
         if veredicto.alerta_seguridad:
@@ -125,120 +92,70 @@ class PolicyEnforcementPoint:
         return veredicto
 
     def _evaluar(self, agente: str, herramienta: str, args: dict, ctx: ContextoPEP) -> VeredictoPEP:
-        def r0(detalle: str) -> VeredictoPEP:
-            regla = ReglaActivada(codigo="R0", descripcion=detalle, decision="BLOQUEADA")
-            return VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, regla_principal=f"R0 · {detalle}",
-                                reglas=(regla,), alerta_seguridad=True)
-
-        if herramienta not in PERMISOS_HERRAMIENTAS.get(agente, frozenset()):
-            return r0(f"{agente} no tiene permiso para {herramienta} (Matriz 1)")
-        try:
-            p = PropuestaPagoSchema.model_validate(args)
-        except ValidationError as e:
-            return r0(f"Argumentos fuera del esquema cerrado ({e.error_count()} errores)")
-        if p.solicitud_id != ctx.solicitud_id:
-            return r0("La propuesta no corresponde a la solicitud en curso")
-        if sellar(ctx.metadata) != ctx.sello_registrado:
-            return r0("Las etiquetas del Sanitizer fueron alteradas después de selladas")
-
         md = ctx.metadata
-        interno = md.origen == "INTERNO_VERIFICADO"
-        prov = (self._vista.buscar_proveedor(proveedor_id=p.proveedor_id) if p.proveedor_id
-                else self._vista.buscar_proveedor(nombre=p.beneficiario))
-        reglas: list[ReglaActivada] = []
+        core = self.core.evaluar_core(
+            agente, herramienta, args, solicitud_id=ctx.solicitud_id, tainted=md.tainted,
+            nivel_riesgo=md.nivel_riesgo, autenticacion_origen_valida=md.spf_dkim_valido,
+            suplantacion=(f"dominio {md.dominio_remitente} parecido a {md.dominio_parecido_a}"
+                          if md.dominio_parecido_a else None),
+            sello_valido=sellar(md) == ctx.sello_registrado)
+        reglas = [ReglaActivada(codigo=self._codigo(r.codigo), descripcion=r.descripcion, decision=r.decision)
+                  for r in core.reglas]
+        if core.integridad_fallida:
+            r = reglas[0]
+            return VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, regla_principal=f"{r.codigo} · {r.descripcion}",
+                                reglas=(r,), alerta_seguridad=True)
 
-        def add(codigo: str, detalle: str, decision: str) -> None:
-            reglas.append(ReglaActivada(codigo=codigo, descripcion=detalle, decision=decision))
-
-        if not prov.encontrado:
-            add("R1", f"«{p.beneficiario}» no está registrado en el maestro de proveedores", "BLOQUEADA")
-        elif normalizar_cuenta(p.cuenta_destino) != normalizar_cuenta(prov.cuenta_registrada):
-            add("R1", f"Cuenta solicitada {p.cuenta_destino} ≠ cuenta registrada de {prov.razon_social} "
-                      f"(…{prov.cuenta_registrada[-4:]})", "BLOQUEADA")
-        if md.nivel_riesgo == "ALTO":
-            add("R2", "Sanitizer: riesgo ALTO (" + ", ".join(md.banderas_anomalia[:4]) + ")", "BLOQUEADA")
-        if not md.spf_dkim_valido:
-            add("R3", "El remitente falla SPF/DKIM/DMARC", "BLOQUEADA")
-        if md.dominio_parecido_a:
-            add("R3", f"Dominio {md.dominio_remitente} parecido a {md.dominio_parecido_a}", "BLOQUEADA")
-        elif prov.encontrado and not interno and md.dominio_remitente != prov.dominio:
-            add("R3", f"Dominio {md.dominio_remitente} distinto al registrado ({prov.dominio})", "BLOQUEADA")
-
-        dup = self._vista.buscar_duplicado(proveedor_id=prov.proveedor_id, numero_factura=p.numero_factura,
-                                           monto_cop=p.monto_cop)
-        if dup.duplicado:
-            add("R4", dup.detalle, "RECHAZADA")
-        sop = self._vista.buscar_soporte(proveedor_id=prov.proveedor_id, numero_oc=p.numero_oc,
-                                         numero_factura=p.numero_factura, monto_cop=p.monto_cop)
-        if not (sop.existe and sop.coincide):
-            add("R5", sop.detalle, "RECHAZADA")
-
+        dec = self.pack.evaluar_politicas_pep(core.args, ctx, bloqueado_por_core=core.bloqueada, reloj=self._reloj)
+        reglas += dec.reglas
         bloqueos = [r for r in reglas if r.decision == "BLOQUEADA"]
         if bloqueos:
-            return VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA,
-                                regla_principal=f"{bloqueos[0].codigo} · {DESCRIPCION_REGLAS[bloqueos[0].codigo]}",
+            c = bloqueos[0].codigo
+            return VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, regla_principal=f"{c} · {self._descripcion(c)}",
                                 reglas=tuple(reglas), alerta_seguridad=True)
         rechazos = [r for r in reglas if r.decision == "RECHAZADA"]
         if rechazos:
-            return VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA,
-                                regla_principal=f"{rechazos[0].codigo} · {DESCRIPCION_REGLAS[rechazos[0].codigo]}",
+            c = rechazos[0].codigo
+            return VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA, regla_principal=f"{c} · {self._descripcion(c)}",
                                 reglas=tuple(reglas))
 
-        # --- Ruta de firmas (Capa 2) ---------------------------------------------------
-        requeridas = [Rol.ANALISTA_CXP, Rol.TESORERO]
-        telefono = False
-        if prov.dias_desde_cambio_cuenta is not None and prov.dias_desde_cambio_cuenta < DIAS_CUENTA_RECIENTE:
-            add("R9", f"Cuenta modificada hace {prov.dias_desde_cambio_cuenta} días", "FIRMAS")
-            telefono = True
-            requeridas.append(Rol.DIRECTOR_FINANCIERO)
-        if p.monto_cop > UMBRAL_ALTO_COP:
-            add("R8", f"Monto {formato_cop(p.monto_cop)} supera {formato_cop(UMBRAL_ALTO_COP)}", "FIRMAS")
-            if Rol.DIRECTOR_FINANCIERO not in requeridas:
-                requeridas.append(Rol.DIRECTOR_FINANCIERO)
-        if md.nivel_riesgo == "MEDIO" or UMBRAL_BAJO_COP < p.monto_cop <= UMBRAL_ALTO_COP:
-            motivo = "riesgo MEDIO" if md.nivel_riesgo == "MEDIO" else f"monto entre {formato_cop(UMBRAL_BAJO_COP)} y {formato_cop(UMBRAL_ALTO_COP)}"
-            add("R7", f"Requiere verificación telefónica: {motivo}", "FIRMAS")
-            telefono = True
-        if not reglas:
-            add("R6", "Riesgo bajo y monto hasta $2.000.000", "FIRMAS")
-        principal = sorted(reglas, key=lambda r: {"R9": 0, "R8": 1, "R7": 2, "R6": 3}[r.codigo])[0]
-
-        h = hash_transaccion(prov.proveedor_id, prov.cuenta_registrada, p.monto_cop)
-        self.registros[p.solicitud_id] = RegistroPago(
-            solicitud_id=p.solicitud_id, proveedor_id=prov.proveedor_id, razon_social=prov.razon_social,
-            cuenta=prov.cuenta_registrada, monto_cop=p.monto_cop, numero_factura=p.numero_factura,
-            numero_oc=p.numero_oc or sop.numero_oc, concepto=p.concepto, hash_transaccion=h,
-            firmas_requeridas=tuple(requeridas), verificacion_telefonica_requerida=telefono,
-            telefono_registrado=prov.telefono_registrado, iniciado_por=ctx.iniciado_por, creado=self._reloj())
+        # U3: una acción crítica desde contexto contaminado nunca se ejecuta sola.
+        if core.requiere_humano:
+            reglas.append(ReglaActivada(codigo=self._codigo("U3"), descripcion=REGLAS_UNIVERSALES["U3"], decision="FIRMAS"))
+        if dec.registro is None:  # defensa en profundidad: sin ruta de firmas no hay ejecución
+            return VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, alerta_seguridad=True,
+                                regla_principal="U3 · El pack no definió una ruta de aprobación humana", reglas=tuple(reglas))
+        self.registros[ctx.solicitud_id] = dec.registro
+        principal = dec.regla_principal or "U3"
         return VeredictoPEP(decision="PENDING_APPROVAL", estado=Estado.PENDIENTE_FIRMA_1,
-                            regla_principal=f"{principal.codigo} · {DESCRIPCION_REGLAS[principal.codigo]}",
-                            reglas=tuple(reglas), firmas_requeridas=tuple(requeridas),
-                            verificacion_telefonica=telefono, telefono_registrado=prov.telefono_registrado,
-                            hash_transaccion=h)
+                            regla_principal=f"{principal} · {self._descripcion(principal)}",
+                            reglas=tuple(reglas), firmas_requeridas=tuple(dec.firmas_requeridas),
+                            verificacion_telefonica=dec.verificacion_telefonica,
+                            telefono_registrado=dec.telefono_registrado, hash_transaccion=dec.hash_accion)
 
     # ====================================================================================
-    # Capa 2 — supervisión humana (Matriz 2)
+    # Capa 2 — supervisión humana (U4 + restricciones del pack)
     # ====================================================================================
-    def _firma_hmac(self, usuario_id: str, reg: RegistroPago, ts: datetime, h: str) -> str:
-        llave = self._repo.usuario(usuario_id)["llave_firma"]
+    def _firma_hmac(self, usuario_id: str, reg, ts: datetime, h: str) -> str:
+        llave = self._directorio.usuario(usuario_id)["llave_firma"]
         return hmac.new(llave, f"{reg.solicitud_id}|{h}|{ts.isoformat()}".encode(), hashlib.sha256).hexdigest()
 
     def _autenticar(self, solicitud_id: str, usuario_id: str, pin: str, accion: str) -> dict:
-        if usuario_id.startswith("agente"):
+        if UniversalPEP.es_identidad_de_agente(usuario_id):
             raise ErrorFirma("Ningún agente de IA puede aprobar, firmar ni rechazar (Matriz 2)")
-        u = self._repo.usuario(usuario_id)
-        if u is None or not self._repo.verificar_pin(usuario_id, pin):
+        u = self._directorio.usuario(usuario_id)
+        if u is None or not self._directorio.verificar_pin(usuario_id, pin):
             self._audit.anexar(actor=f"humano:{usuario_id}", evento=f"{accion}_DENEGADA", solicitud_id=solicitud_id,
                                payload={"motivo": "MFA fallida (PIN incorrecto)"})
             raise ErrorFirma("Autenticación MFA fallida: PIN incorrecto")
         return u
 
-    def _denegar(self, reg: RegistroPago, u: dict, motivo: str) -> None:
+    def _denegar(self, reg, u: dict, motivo: str) -> None:
         self._audit.anexar(actor=f"humano:{u['usuario_id']}", evento="FIRMA_DENEGADA", solicitud_id=reg.solicitud_id,
-                           estado=reg.estado.value, payload={"motivo": motivo, "rol": u["rol"].value})
+                           estado=reg.estado.value, payload={"motivo": motivo, "rol": str(u["rol"])})
         raise ErrorFirma(motivo)
 
-    def _expirar_si_vencida(self, reg: RegistroPago) -> bool:
+    def _expirar_si_vencida(self, reg) -> bool:
         if reg.estado in ESTADOS_PENDIENTES and self._reloj() - reg.creado > timedelta(hours=HORAS_VIGENCIA_FIRMA):
             reg.estado = Estado.EXPIRADA
             self.estados_finales[reg.solicitud_id] = reg.estado
@@ -250,8 +167,7 @@ class PolicyEnforcementPoint:
     def firmar(self, solicitud_id: str, usuario_id: str, pin: str, verificacion_telefonica: bool = False) -> dict:
         reg = self.registros.get(solicitud_id)
         if reg is None:
-            estado = self.estados_finales.get(solicitud_id)
-            if estado is Estado.BLOQUEADA:
+            if self.estados_finales.get(solicitud_id) is Estado.BLOQUEADA:
                 raise ErrorFirma("Solicitud BLOQUEADA: no se puede aprobar. Solo el Oficial de Seguridad puede revisar el incidente")
             raise ErrorFirma("No hay una solicitud pendiente de firma con ese identificador")
         u = self._autenticar(solicitud_id, usuario_id, pin, "FIRMA")
@@ -260,28 +176,23 @@ class PolicyEnforcementPoint:
         if reg.estado not in ESTADOS_PENDIENTES:
             raise ErrorFirma(f"La solicitud está {reg.estado.value}; no admite firmas")
 
-        rol: Rol = u["rol"]
-        if rol is Rol.ADMIN_PLATAFORMA:
-            self._denegar(reg, u, "Administradores de plataforma no pueden firmar pagos (ISO 27001 8.2)")
-        esperado = reg.firmas_requeridas[len(reg.firmas)]
-        if rol is not esperado:
-            self._denegar(reg, u, f"Se espera la firma {len(reg.firmas) + 1} de {ETIQUETA_ROL[esperado]}; "
-                                  f"{u['nombre']} es {ETIQUETA_ROL[rol]}")
-        if usuario_id == reg.iniciado_por:
-            self._denegar(reg, u, "Segregación de funciones: quien inició la solicitud no puede firmarla (ISO 27001 5.3)")
-        if any(f.usuario_id == usuario_id for f in reg.firmas):
-            self._denegar(reg, u, "Segregación de funciones: una persona no puede firmar dos veces la misma solicitud")
-        prov = self._vista.buscar_proveedor(proveedor_id=reg.proveedor_id)
-        if (prov.cambio_cuenta_aprobado_por == usuario_id and prov.dias_desde_cambio_cuenta is not None
-                and prov.dias_desde_cambio_cuenta < DIAS_RESTRICCION_SOD_CAMBIO_CUENTA):
-            self._denegar(reg, u, f"Segregación de funciones: {u['nombre']} aprobó el cambio de cuenta de este "
-                                  f"proveedor hace {prov.dias_desde_cambio_cuenta} días (restricción de 30 días)")
-        if verificacion_telefonica and rol in (Rol.ANALISTA_CXP, Rol.TESORERO):
-            reg.verificacion_telefonica_hecha = True
+        rol = str(u["rol"])
+        previos = [f.usuario_id for f in reg.firmas]
+        if rol == Rol.ADMIN_PLATAFORMA:  # U4
+            self._denegar(reg, u, UniversalPEP.verificar_sod(usuario_id, iniciado_por=None, firmantes_previos=[],
+                                                             es_admin_plataforma=True))
+        esperado = str(reg.firmas_requeridas[len(reg.firmas)])
+        if rol != esperado:
+            self._denegar(reg, u, f"Se espera la firma {len(reg.firmas) + 1} de {etiqueta_rol(esperado)}; "
+                                  f"{u['nombre']} es {etiqueta_rol(rol)}")
+        motivo = UniversalPEP.verificar_sod(usuario_id, iniciado_por=reg.iniciado_por, firmantes_previos=previos,
+                                            es_admin_plataforma=False)  # U4
+        if motivo:
+            self._denegar(reg, u, motivo)
         es_ultima = len(reg.firmas) + 1 == len(reg.firmas_requeridas)
-        if es_ultima and reg.verificacion_telefonica_requerida and not reg.verificacion_telefonica_hecha:
-            self._denegar(reg, u, f"Falta la constancia de verificación telefónica al número registrado "
-                                  f"{reg.telefono_registrado} (la registra el Analista o el Tesorero)")
+        motivo = self.pack.verificar_firmante(reg, u, verificacion_telefonica, es_ultima)
+        if motivo:
+            self._denegar(reg, u, motivo)
 
         ts = self._reloj()
         firma = Firma(usuario_id=usuario_id, nombre=u["nombre"], rol=rol, hash_transaccion=reg.hash_transaccion,
@@ -291,28 +202,25 @@ class PolicyEnforcementPoint:
         n = len(reg.firmas)
         self._audit.anexar(actor=f"humano:{usuario_id}", evento=f"FIRMA_{n}", solicitud_id=solicitud_id,
                            estado=reg.estado.value,
-                           payload={"rol": rol.value, "hash_transaccion": reg.hash_transaccion,
+                           payload={"rol": rol, "hash_transaccion": reg.hash_transaccion,
                                     "firma_hmac": firma.firma_hmac[:16] + "…",
                                     "verificacion_telefonica": verificacion_telefonica})
         if n < len(reg.firmas_requeridas):
             reg.estado = [Estado.PENDIENTE_FIRMA_1, Estado.PENDIENTE_FIRMA_2, Estado.PENDIENTE_FIRMA_3][n]
             self.estados_finales[solicitud_id] = reg.estado
             return {"ok": True, "estado": reg.estado.value, "mensaje": f"Firma {n} de {len(reg.firmas_requeridas)} registrada"}
-        return self._ordenar_pago(reg)
+        return self._ordenar_ejecucion(reg)
 
-    def _ordenar_pago(self, reg: RegistroPago) -> dict:
-        """Procedimiento paso 8: re-verificar firmas y SoD; ordenar el pago."""
-        h_actual = hash_transaccion(reg.proveedor_id, reg.cuenta, reg.monto_cop)
-        prov = self._vista.buscar_proveedor(proveedor_id=reg.proveedor_id)
-        problemas = []
-        if normalizar_cuenta(prov.cuenta_registrada) != normalizar_cuenta(reg.cuenta):
-            problemas.append("La cuenta del maestro cambió después de iniciar las firmas")
+    def _ordenar_ejecucion(self, reg) -> dict:
+        """Re-verificar firmas y SoD sobre los datos ACTUALES; luego ordenar la ejecución al servicio del pack."""
+        h_actual = self.pack.hash_registro(reg)
+        problemas = list(self.pack.revalidar_registro(reg))
         if len({f.usuario_id for f in reg.firmas}) != len(reg.firmas):
             problemas.append("Firmantes repetidos")
         for f in reg.firmas:
             if f.hash_transaccion != h_actual or not hmac.compare_digest(
                     f.firma_hmac, self._firma_hmac(f.usuario_id, reg, f.timestamp, h_actual)):
-                problemas.append(f"La firma de {f.nombre} no cubre los datos actuales (beneficiario/cuenta/monto cambiaron)")
+                problemas.append(f"La firma de {f.nombre} no cubre los datos actuales ({self.pack.descripcion_hash})")
             if self._reloj() - f.timestamp > timedelta(hours=HORAS_VIGENCIA_FIRMA):
                 problemas.append(f"La firma de {f.nombre} venció")
         if problemas:
@@ -322,45 +230,43 @@ class PolicyEnforcementPoint:
                                estado=reg.estado.value, payload={"problemas": problemas})
             return {"ok": False, "estado": reg.estado.value, "mensaje": "; ".join(problemas)}
 
-        orden = OrdenPago(solicitud_id=reg.solicitud_id, proveedor_id=reg.proveedor_id, beneficiario=reg.razon_social,
-                          cuenta_destino=reg.cuenta, monto_cop=reg.monto_cop, numero_factura=reg.numero_factura,
-                          hash_transaccion=h_actual)
+        orden = self.pack.orden_desde_registro(reg, h_actual)
         firma_pep = hmac.new(self._llave, orden.canonico(), hashlib.sha256).hexdigest()
-        self._audit.anexar(actor="pep", evento="ORDEN_PAGO", solicitud_id=reg.solicitud_id, estado=reg.estado.value,
+        self._audit.anexar(actor="pep", evento=self.pack.evento_orden, solicitud_id=reg.solicitud_id,
+                           estado=reg.estado.value,
                            payload={"hash_transaccion": h_actual, "firmantes": [f.usuario_id for f in reg.firmas]})
         try:
-            pago = self._pagos.ejecutar(orden, firma_pep, actor="pep")
-        except PagoRechazado as e:
+            resultado = self.pack.ejecutar_accion_aprobada(orden, firma_pep)
+        except EjecucionRechazada as e:
             reg.estado = Estado.RECHAZADA
             self.estados_finales[reg.solicitud_id] = reg.estado
-            self._audit.anexar(actor="servicio_pagos", evento="PAGO_RECHAZADO", solicitud_id=reg.solicitud_id,
-                               estado=reg.estado.value, payload={"motivo": str(e)})
+            self._audit.anexar(actor=self.pack.actor_servicio, evento=self.pack.evento_rechazo,
+                               solicitud_id=reg.solicitud_id, estado=reg.estado.value, payload={"motivo": str(e)})
             return {"ok": False, "estado": reg.estado.value, "mensaje": str(e)}
         reg.estado = Estado.EJECUTADA
-        reg.pago = pago
+        reg.resultado = resultado
         self.estados_finales[reg.solicitud_id] = reg.estado
-        self._audit.anexar(actor="servicio_pagos", evento="EJECUTADA", solicitud_id=reg.solicitud_id,
-                           estado=reg.estado.value,
-                           payload={"pago_id": pago["pago_id"], "monto_cop": reg.monto_cop, "cuenta": reg.cuenta,
-                                    "saldo_resultante": pago["saldo_resultante"]})
-        return {"ok": True, "estado": reg.estado.value, "mensaje": f"Pago {pago['pago_id']} ejecutado", "pago": pago}
+        self._audit.anexar(actor=self.pack.actor_servicio, evento="EJECUTADA", solicitud_id=reg.solicitud_id,
+                           estado=reg.estado.value, payload=self.pack.payload_ejecucion(reg, resultado))
+        return {"ok": True, "estado": reg.estado.value, "mensaje": self.pack.mensaje_ejecucion(resultado),
+                "pago": resultado}
 
     def rechazar(self, solicitud_id: str, usuario_id: str, pin: str, motivo: str = "") -> dict:
         u = self._autenticar(solicitud_id, usuario_id, pin, "RECHAZO")
         if u["rol"] not in ROLES_QUE_PUEDEN_RECHAZAR:
-            raise ErrorFirma(f"{ETIQUETA_ROL[u['rol']]} no puede rechazar solicitudes")
+            raise ErrorFirma(f"{etiqueta_rol(u['rol'])} no puede rechazar solicitudes")
         reg = self.registros.get(solicitud_id)
         if reg is None or reg.estado not in ESTADOS_PENDIENTES:
             raise ErrorFirma("Solo se pueden rechazar solicitudes pendientes de firma")
         reg.estado = Estado.RECHAZADA
         self.estados_finales[solicitud_id] = reg.estado
         self._audit.anexar(actor=f"humano:{usuario_id}", evento="RECHAZADA_POR_HUMANO", solicitud_id=solicitud_id,
-                           estado=reg.estado.value, payload={"rol": u["rol"].value, "motivo": motivo[:300]})
+                           estado=reg.estado.value, payload={"rol": str(u["rol"]), "motivo": motivo[:300]})
         return {"ok": True, "estado": reg.estado.value, "mensaje": f"Rechazada por {u['nombre']}"}
 
     def revisar_incidente(self, solicitud_id: str, usuario_id: str, pin: str, nota: str = "") -> dict:
         u = self._autenticar(solicitud_id, usuario_id, pin, "REVISION")
-        if u["rol"] is not Rol.OFICIAL_SEGURIDAD:
+        if str(u["rol"]) != Rol.OFICIAL_SEGURIDAD:
             raise ErrorFirma("Solo el Oficial de Seguridad y Cumplimiento puede revisar incidentes bloqueados")
         if self.estados_finales.get(solicitud_id) is not Estado.BLOQUEADA:
             raise ErrorFirma("La solicitud no está bloqueada")

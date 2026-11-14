@@ -10,6 +10,29 @@ from enum import StrEnum
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def cargar_env(ruta: Path = ROOT / ".env") -> None:
+    """Lee el archivo .env de la raíz. Las variables ya definidas en la terminal tienen prioridad.
+    CFZT_SIN_ENV=1 lo ignora (lo usan las pruebas y el validador de bases)."""
+    if os.environ.get("CFZT_SIN_ENV") or not ruta.exists():
+        return
+    for linea in ruta.read_text(encoding="utf-8").splitlines():
+        linea = linea.strip()
+        if not linea or linea.startswith("#") or "=" not in linea:
+            continue
+        clave, valor = linea.split("=", 1)
+        clave = clave.strip().removeprefix("export ").strip()
+        valor = valor.strip()
+        if valor.startswith(f"{clave}="):  # tolera el error común CLAVE=CLAVE="valor"
+            valor = valor[len(clave) + 1:].strip()
+        if len(valor) >= 2 and valor[0] == valor[-1] and valor[0] in "'\"":
+            valor = valor[1:-1]
+        if clave:
+            os.environ.setdefault(clave, valor)
+
+
+cargar_env()
 RUNTIME_DIR = Path(os.environ.get("CFZT_RUNTIME_DIR", ROOT / "runtime"))
 
 # --- Matriz 3: umbrales (COP) -------------------------------------------------------
@@ -32,6 +55,30 @@ class Rol(StrEnum):
     AUDITOR = "AUDITOR"
 
 
+class Modo(StrEnum):
+    """Configuraciones comparables (misma base de código, mismos escenarios).
+
+    Sirven para responder: ¿cada componente funciona por sí solo?, ¿la arquitectura completa gana a
+    un único modelo que verifica?
+    """
+    COMPLETO = "COMPLETO"              # Sanitizer + PEP determinista + firmas humanas
+    SOLO_PEP = "SOLO_PEP"              # PEP + firmas, sin Sanitizer semántico
+    SOLO_SANITIZER = "SOLO_SANITIZER"  # el Sanitizer bloquea si el riesgo es ALTO; si no, se paga directo
+    SOLO_LLM = "SOLO_LLM"              # un único modelo revisa correo + propuesta + maestro y decide
+    SIN_DEFENSA = "SIN_DEFENSA"        # confianza implícita: la herramienta va directo al servicio de pagos
+
+
+DESCRIPCION_MODO = {
+    Modo.COMPLETO: "Sanitizer + PEP determinista + firmas humanas",
+    Modo.SOLO_PEP: "PEP determinista + firmas, sin Sanitizer",
+    Modo.SOLO_SANITIZER: "Solo el Sanitizer: bloquea riesgo ALTO, el resto se paga sin más controles",
+    Modo.SOLO_LLM: "Solo un modelo verificador (LLM-como-juez): aprueba o bloquea, sin Sanitizer ni PEP",
+    Modo.SIN_DEFENSA: "Sin defensa: confianza implícita en los agentes",
+}
+MODOS_CON_PEP = frozenset({Modo.COMPLETO, Modo.SOLO_PEP})
+MODOS_CON_SANITIZER = frozenset({Modo.COMPLETO, Modo.SOLO_SANITIZER})
+
+
 ROLES_QUE_PUEDEN_RECHAZAR = frozenset({Rol.ANALISTA_CXP, Rol.TESORERO, Rol.DIRECTOR_FINANCIERO,
                                        Rol.OFICIAL_SEGURIDAD})
 
@@ -44,6 +91,25 @@ ETIQUETA_ROL = {
     Rol.ADMIN_PLATAFORMA: "Administrador de plataforma",
     Rol.AUDITOR: "Auditor",
 }
+
+
+class RolDevOps(StrEnum):
+    """Roles del Policy Pack devops_cloud (Oficial de Seguridad, Admin de plataforma y Auditor son universales)."""
+    DEVOPS_SENIOR = "DEVOPS_SENIOR"
+    LIDER_SRE = "LIDER_SRE"
+    INGENIERO_SOPORTE = "INGENIERO_SOPORTE"
+
+
+ETIQUETA_ROL.update({
+    RolDevOps.DEVOPS_SENIOR: "Ingeniero DevOps Senior",
+    RolDevOps.LIDER_SRE: "Líder SRE / Seguridad",
+    RolDevOps.INGENIERO_SOPORTE: "Ingeniero de soporte (triaje)",
+})
+ROLES_QUE_PUEDEN_RECHAZAR = ROLES_QUE_PUEDEN_RECHAZAR | {RolDevOps.DEVOPS_SENIOR, RolDevOps.LIDER_SRE}
+
+
+def etiqueta_rol(rol: str) -> str:
+    return ETIQUETA_ROL.get(rol, str(rol))
 
 # --- Proveedor LLM (P1) --------------------------------------------------------------
 LLM_PROVIDER = os.environ.get("CFZT_LLM", "local").lower()      # local | groq | gemini

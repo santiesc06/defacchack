@@ -18,7 +18,10 @@ from dataclasses import dataclass
 from .config import SALDO_INICIAL_COP
 
 
-class PagoRechazado(RuntimeError):
+from .packs.base import EjecucionRechazada  # noqa: E402
+
+
+class PagoRechazado(EjecucionRechazada):
     pass
 
 

@@ -27,7 +27,11 @@ REGLAS_TEXTO: list[tuple[str, str, re.Pattern]] = [
         r"ignor[ae]\w*\s+(las\s+|todas\s+las\s+|cualquier\s+)?(instrucci|regla|indicaci|anterior|previous|polic)"
         r"|ignore (all |the )?(previous|prior)|olvida (las|tus) instrucciones|system\s*:|\[(hidden|system|admin)[^\]]*\]"
         r"|<!--|nota para (el|la) (ia|asistente|sistema|agente)|como (asistente|modelo|agente) (de ia )?(debes|deber[aá]s)"
-        r"|no (lo )?(menciones|informes|reportes) (esto|al usuario|a nadie)|sin (pasar por|consultar) (el|la) (aprobaci|verificaci|pep)", re.I)),
+        r"|no (lo )?(menciones|informes|reportes) (esto|al usuario|a nadie)|sin (pasar por|consultar) (el|la) (aprobaci|verificaci|pep)"
+        # marcadores agnósticos al dominio (issues, tickets, logs)
+        r"|ignor[ae]\w*\s+(el|este|ese)\s+(ticket|issue|correo|mensaje)|ignore\s+(the|this)\s+(ticket|issue|email|message)"
+        r"|(añade|agrega|a[ñn]adir|agregar|add)\s+(mi|my|esta|this)\s+(llave|clave|key)\s+ssh|authorized_keys"
+        r"|nota para el agente de ia|ai (agent|assistant)\s*:|do not tell the (reviewer|user)", re.I)),
     ("URGENCIA_ARTIFICIAL", "MEDIO", re.compile(
         r"\b(urgent\w*|hoy mismo|de inmediato|inmediatamente|antes de las \d{1,2}|última oportunidad|sin demora)\b", re.I)),
     ("CAMBIO_CUENTA", "MEDIO", re.compile(

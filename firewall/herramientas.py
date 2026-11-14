@@ -1,26 +1,31 @@
 """Herramientas LangChain con contratos Pydantic + ToolGateway.
 
-- Herramientas del Orquestador: SOLO LECTURA sobre el maestro, OC e historial.
-- Herramienta del Agente Financiero: `solicitar_ejecucion_pago`. Su implementación NO paga: entrega
-  la invocación al `ToolGateway`, que (1) la somete al PEP y (2) pide al Agente Explicador que se la
-  explique a la persona y le pida confirmación. No existe ninguna herramienta de aprobación o firma
-  expuesta a los agentes (Matriz 2).
+- Herramientas de solo lectura del Orquestador (pack de pagos: maestro, OC e historial).
+- Herramienta crítica del Agente Ejecutor del pack activo (pagos: `solicitar_ejecucion_pago`; DevOps:
+  `solicitar_cambio_infraestructura`), declarada en su ToolManifest. Su implementación NO paga: entrega
+  la invocación al `ToolGateway`, que (1) la somete al control del modo activo (PEP en COMPLETO y
+  SOLO_PEP) y (2) pide al Agente Explicador que se la explique a la persona y le pida confirmación.
+  No existe ninguna herramienta de aprobación o firma expuesta a los agentes (Matriz 2).
+- Los modos SOLO_SANITIZER, SOLO_LLM y SIN_DEFENSA existen para COMPARAR (evaluacion_empirica.py):
+  en ellos, si el control no bloquea, el pago se ejecuta sin firmas humanas.
 """
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from typing import Callable
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .config import ETIQUETA_ROL, formato_cop
-from .pagos import OrdenPago, PagoRechazado, ServicioPagosMock
-from .pep import ContextoPEP, PolicyEnforcementPoint, hash_transaccion
+from .config import MODOS_CON_PEP, Modo, etiqueta_rol
+from .llm import ErrorModelo
+from .packs.base import EjecucionRechazada
+from .pep import ContextoPEP, PolicyEnforcementPoint
 from .repositorio import VistaSoloLectura
-from .schemas import (PATRON_FACTURA, PATRON_OC, Estado, ExplicacionSchema, PropuestaPagoSchema, ProveedorInfo,
-                      ResultadoDuplicado, ResultadoOC, VeredictoPEP)
+from .schemas import (PATRON_FACTURA, PATRON_OC, Estado, ExplicacionSchema, ProveedorInfo, ResultadoDuplicado,
+                      ResultadoOC, VeredictoPEP)
 
 
 class _Args(BaseModel):
@@ -91,91 +96,146 @@ def _solo_digitos(s: str) -> str:
 
 
 def explicacion_coherente(exp: ExplicacionSchema, monto: int, cuenta: str) -> bool:
-    """Control determinista: la explicación del LLM debe citar el monto y la cuenta exactos."""
+    """Control determinista (pack de pagos): la explicación del LLM debe citar el monto y la cuenta exactos."""
     texto = _solo_digitos(f"{exp.resumen} {exp.pregunta_confirmacion}")
     return str(monto) in texto and _solo_digitos(cuenta) in texto
 
 
 class ToolGateway:
-    """Interceptor de TODAS las herramientas del Agente Financiero."""
+    """Interceptor de TODAS las herramientas del Agente Ejecutor, para cualquier Policy Pack."""
 
-    def __init__(self, pep: PolicyEnforcementPoint, pagos: ServicioPagosMock, audit,
-                 explicar: Callable[[dict], tuple[ExplicacionSchema, str]]) -> None:
+    def __init__(self, pep: PolicyEnforcementPoint, audit, explicar: Callable[[dict], tuple[ExplicacionSchema, str]],
+                 verificador=None) -> None:
         self._pep = pep
-        self._pagos = pagos
+        self.pack = pep.pack
         self._audit = audit
         self._explicar = explicar
+        self._verificador = verificador
 
-    def invocar(self, agente: str, herramienta: str, args: dict, ctx: ContextoPEP, *, pep_activo: bool) -> ResultadoGateway:
+    def invocar(self, agente: str, herramienta: str, args: dict, ctx: ContextoPEP, *, modo: Modo) -> ResultadoGateway:
         self._audit.anexar(actor=agente, evento="INVOCACION_HERRAMIENTA", solicitud_id=ctx.solicitud_id,
-                           payload={"herramienta": herramienta, "argumentos": args})
-        if pep_activo:
+                           payload={"herramienta": herramienta, "argumentos": args, "modo": modo.value,
+                                    "dominio": self.pack.id})
+        if modo in MODOS_CON_PEP:
             v = self._pep.evaluar(agente, herramienta, args, ctx)
+        elif modo is Modo.SOLO_SANITIZER:
+            v = self._solo_sanitizer(args, ctx, agente)
+        elif modo is Modo.SOLO_LLM:
+            v = self._solo_llm(args, ctx, agente)
         else:
-            v = self._ejecutar_sin_control(args, ctx)
+            v = self._ejecutar_sin_control(args, ctx, "SIN DEFENSA · confianza implícita: el agente ejecutó directamente",
+                                           "NINGUNO", agente)
 
-        reg = self._pep.registros.get(ctx.solicitud_id) if pep_activo else None
-        datos_verificados = {
-            "beneficiario": reg.razon_social if reg else args.get("beneficiario"),
-            "cuenta": reg.cuenta if reg else args.get("cuenta_destino"),
-            "monto_cop": reg.monto_cop if reg else args.get("monto_cop"),
-            "monto_formateado": formato_cop(reg.monto_cop if reg else (args.get("monto_cop") if isinstance(args.get("monto_cop"), int) else None)),
-            "hash_transaccion": v.hash_transaccion,
-            "fuente": "Maestro de proveedores (verificado por el PEP)" if reg else "Datos propuestos por el agente (sin verificar)",
-        }
+        reg = self._pep.registros.get(ctx.solicitud_id) if modo in MODOS_CON_PEP else None
+        dv = self.pack.datos_verificados(reg, args)
+        if dv.get("hash_transaccion") is None:
+            dv["hash_transaccion"] = v.hash_transaccion
         datos = {
-            "propuesta": {**args, "beneficiario": datos_verificados["beneficiario"],
-                          "cuenta_destino": datos_verificados["cuenta"]},
+            "dominio": self.pack.id,
+            "propuesta": self.pack.propuesta_para_explicador(args, dv),
             "veredicto": v.model_dump(mode="json"),
-            # Sin `evidencias`: citan texto del atacante y el Explicador no debe ver texto del correo.
+            # Sin `evidencias`: citan texto del atacante y el Explicador no debe ver texto del correo/issue.
             "metadata": ctx.metadata.model_dump(mode="json", exclude={"evidencias"}),
-            "etiquetas_firmantes": [ETIQUETA_ROL[r] for r in v.firmas_requeridas],
+            "etiquetas_firmantes": [etiqueta_rol(r) for r in v.firmas_requeridas],
         }
-        exp, origen = self._explicar(datos)
-        monto = datos_verificados["monto_cop"] if isinstance(datos_verificados["monto_cop"], int) else 0
-        coherente = explicacion_coherente(exp, monto, str(datos_verificados["cuenta"] or ""))
+        if modo in MODOS_CON_PEP:
+            try:
+                exp, origen = self._explicar(datos)
+            except ErrorModelo as e:  # la decisión del PEP no depende del Explicador: se avisa y se sigue
+                exp = ExplicacionSchema(
+                    titulo="Explicación no disponible (fallo del modelo)",
+                    resumen=f"El modelo no generó la explicación ({str(e)[:200]}). Revise los datos verificados por el PEP.",
+                    recomendacion="REVISAR_CON_CUIDADO",
+                    pregunta_confirmacion="Decida solo con los datos verificados de abajo.")
+                origen = "fallo del modelo"
+        else:  # sin supervisión humana no hay a quién pedir confirmación: resumen informativo por plantilla
+            exp, origen = self.pack.explicar_local(datos), "plantilla (modo sin supervisión humana)"
+        coherente = self.pack.explicacion_coherente(exp, dv)
         self._audit.anexar(actor="agente:explicador", evento="EXPLICACION_A_HUMANO", solicitud_id=ctx.solicitud_id,
                            estado=v.estado.value,
                            payload={"titulo": exp.titulo, "recomendacion": exp.recomendacion, "coherente": coherente,
                                     "origen": origen})
-        return ResultadoGateway(v, exp, coherente, origen, datos_verificados)
+        return ResultadoGateway(v, exp, coherente, origen, dv)
 
-    def _ejecutar_sin_control(self, args: dict, ctx: ContextoPEP) -> VeredictoPEP:
-        """Línea base «confianza implícita» (P4): sin reglas, sin firmas, sin confirmación."""
+    # ---- modos de comparación ---------------------------------------------------------------
+    def _registrar_decision(self, ctx: ContextoPEP, v: VeredictoPEP, evento: str, extra: dict | None = None) -> None:
+        self._pep.estados_finales[ctx.solicitud_id] = v.estado
+        self._audit.anexar(actor=f"control:{v.control.lower()}", evento=evento, solicitud_id=ctx.solicitud_id,
+                           estado=v.estado.value,
+                           payload={"decision": v.decision, "regla_principal": v.regla_principal, **(extra or {})})
+
+    def _solo_sanitizer(self, args: dict, ctx: ContextoPEP, agente: str) -> VeredictoPEP:
+        t0 = time.perf_counter()
+        md = ctx.metadata
+        if md.nivel_riesgo == "ALTO":
+            v = VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, pep_activo=False, control="SANITIZER",
+                             regla_principal="Sanitizer: riesgo ALTO (" + ", ".join(md.banderas_anomalia[:4]) + ")",
+                             alerta_seguridad=True, latencia_ms=round((time.perf_counter() - t0) * 1000, 3))
+            self._registrar_decision(ctx, v, "DECISION_SANITIZER")
+            return v
+        return self._ejecutar_sin_control(
+            args, ctx, f"SOLO SANITIZER · riesgo {md.nivel_riesgo}: no bloqueó y la acción se ejecutó sin más controles",
+            "SANITIZER", agente, t0)
+
+    def _solo_llm(self, args: dict, ctx: ContextoPEP, agente: str) -> VeredictoPEP:
+        t0 = time.perf_counter()
         try:
-            p = PropuestaPagoSchema.model_validate(args)
+            res, origen = self._verificador(ctx.correo, args, self.pack.datos_internos(args))
+        except Exception as e:  # falla cerrada: si el único control no responde, no se ejecuta
+            v = VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, pep_activo=False, control="LLM",
+                             regla_principal=f"Verificador LLM no disponible ({type(e).__name__}): falla cerrada",
+                             latencia_ms=round((time.perf_counter() - t0) * 1000, 3))
+            self._registrar_decision(ctx, v, "DECISION_VERIFICADOR_LLM", {"error": str(e)[:200]})
+            return v
+        if res.decision == "BLOQUEAR":
+            v = VeredictoPEP(decision="BLOQUEADA", estado=Estado.BLOQUEADA, pep_activo=False, control="LLM",
+                             regla_principal=f"Verificador LLM ({res.nivel_riesgo}): {res.motivo}"[:400],
+                             alerta_seguridad=True, latencia_ms=round((time.perf_counter() - t0) * 1000, 3))
+            self._registrar_decision(ctx, v, "DECISION_VERIFICADOR_LLM", {"origen": origen})
+            return v
+        return self._ejecutar_sin_control(
+            args, ctx, f"SOLO LLM · el verificador aprobó ({res.nivel_riesgo}): {res.motivo}"[:400], "LLM", agente, t0)
+
+    def _ejecutar_sin_control(self, args: dict, ctx: ContextoPEP, regla: str, control: str, agente: str,
+                              t0: float | None = None) -> VeredictoPEP:
+        """Ejecución directa, sin PEP ni firmas (solo en modos de comparación)."""
+        t0 = t0 if t0 is not None else time.perf_counter()
+
+        def lat() -> float:
+            return round((time.perf_counter() - t0) * 1000, 3)
+
+        try:
+            resultado, h = self.pack.ejecutar_directo(args, actor=agente)
         except ValidationError:
-            return VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA, pep_activo=False,
-                                regla_principal="Servicio de pagos: argumentos ilegibles")
-        h = hash_transaccion(p.proveedor_id, p.cuenta_destino, p.monto_cop)
-        orden = OrdenPago(solicitud_id=p.solicitud_id, proveedor_id=p.proveedor_id, beneficiario=p.beneficiario,
-                          cuenta_destino=p.cuenta_destino, monto_cop=p.monto_cop, numero_factura=p.numero_factura,
-                          hash_transaccion=h)
-        try:
-            pago = self._pagos.ejecutar(orden, None, actor="agente:financiero")
-        except PagoRechazado as e:
-            return VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA, regla_principal=f"Servicio de pagos: {e}",
-                                pep_activo=False, hash_transaccion=h)
-        self._pep.estados_finales[ctx.solicitud_id] = Estado.EJECUTADA
-        self._audit.anexar(actor="servicio_pagos", evento="EJECUTADA_SIN_PEP", solicitud_id=ctx.solicitud_id,
-                           estado=Estado.EJECUTADA.value,
-                           payload={"pago_id": pago["pago_id"], "monto_cop": p.monto_cop, "cuenta": p.cuenta_destino,
-                                    "saldo_resultante": pago["saldo_resultante"]})
-        return VeredictoPEP(decision="EJECUTADA", estado=Estado.EJECUTADA,
-                            regla_principal="PEP DESACTIVADO · confianza implícita: el agente ejecutó directamente",
-                            pep_activo=False, hash_transaccion=h)
+            v = VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA, pep_activo=False, control=control,
+                             regla_principal="Servicio de ejecución: argumentos ilegibles", latencia_ms=lat())
+            self._registrar_decision(ctx, v, "EJECUCION_RECHAZADA")
+            return v
+        except EjecucionRechazada as e:
+            v = VeredictoPEP(decision="RECHAZADA", estado=Estado.RECHAZADA, regla_principal=f"Servicio de ejecución: {e}",
+                             pep_activo=False, control=control, latencia_ms=lat())
+            self._registrar_decision(ctx, v, "EJECUCION_RECHAZADA")
+            return v
+        v = VeredictoPEP(decision="EJECUTADA", estado=Estado.EJECUTADA, regla_principal=regla, pep_activo=False,
+                         control=control, hash_transaccion=h, latencia_ms=lat())
+        self._registrar_decision(ctx, v, "EJECUTADA_SIN_PEP", self.pack.payload_ejecucion(None, resultado))
+        return v
 
 
-def herramienta_financiera(gateway: ToolGateway, ctx: ContextoPEP, pep_activo: bool,
-                           destino: list) -> StructuredTool:
-    """Herramienta del Agente Financiero, ligada al contexto de la solicitud en curso."""
-    def solicitar_ejecucion_pago(**kwargs) -> dict:
-        res = gateway.invocar("agente:financiero", "solicitar_ejecucion_pago", kwargs, ctx, pep_activo=pep_activo)
+def herramienta_financiera(gateway: ToolGateway, ctx: ContextoPEP, modo: Modo, destino: list) -> StructuredTool:
+    """Herramienta crítica del pack activo, ligada al contexto de la solicitud en curso.
+    (Nombre histórico: en el pack de pagos es `solicitar_ejecucion_pago`.)"""
+    pack = gateway.pack
+    manifiesto = pack.manifiestos[pack.herramienta_ejecutora]
+
+    def herramienta_critica(**kwargs) -> dict:
+        res = gateway.invocar(pack.agente_ejecutor, manifiesto.nombre, kwargs, ctx, modo=modo)
         destino.append(res)
         # Al agente solo vuelve el resultado; no puede reintentar ni ver detalles de firma.
         return {"decision": res.veredicto.decision, "estado": res.veredicto.estado.value}
 
-    return StructuredTool.from_function(
-        solicitar_ejecucion_pago, name="solicitar_ejecucion_pago", args_schema=PropuestaPagoSchema,
-        description=("Entrega una propuesta de pago al PEP. NO ejecuta el pago: el PEP decide la ruta y una persona "
-                     "debe confirmar y firmar."))
+    return StructuredTool.from_function(herramienta_critica, name=manifiesto.nombre, args_schema=manifiesto.esquema_args,
+                                        description=manifiesto.descripcion)
+
+
+herramienta_ejecutora = herramienta_financiera

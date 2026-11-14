@@ -104,6 +104,6 @@ def test_control_de_coherencia_detecta_explicacion_engañosa():
     assert explicacion_coherente(buena, 1_250_000, "123-456789-01")
 
 
-def test_proveedor_remoto_sin_llave_cae_a_local():
-    p = ProveedorLLM("groq")
-    assert "local" in p.descripcion
+def test_proveedor_remoto_sin_conexion():
+    assert "SIN CONEXIÓN" in ProveedorLLM("groq", estricto=True).descripcion
+    assert "local" in ProveedorLLM("groq", estricto=False).descripcion

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from .config import Rol
+from . import fuente_datos
 from .data import seed
 from .schemas import ProveedorInfo, ResultadoDuplicado, ResultadoOC
 
@@ -31,34 +32,55 @@ def _hash_pin(usuario_id: str, pin: str) -> str:
     return hashlib.sha256(f"cfzt-demo-salt|{usuario_id}|{pin}".encode()).hexdigest()
 
 
+def _datos_demo() -> dict:
+    return {"proveedores": seed.PROVEEDORES, "ordenes": seed.ORDENES_COMPRA, "historial": seed.HISTORIAL_PAGOS,
+            "usuarios": seed.USUARIOS, "origen": fuente_datos.describir(None, None)}
+
+
 class Repositorio:
-    def __init__(self, reloj: Reloj = reloj_sistema) -> None:
+    """Datos de solo lectura. Fuente: base SQL (CFZT_DB_URL / CFZT_DB_SQL) o datos de demostración."""
+
+    def __init__(self, reloj: Reloj = reloj_sistema, datos: dict | None = None) -> None:
         self._reloj = reloj
         ahora = reloj()
+        datos = datos or fuente_datos.cargar() or _datos_demo()
+        self.origen_datos = datos.get("origen", "datos en memoria")
+
+        def hace(dias) -> datetime | None:
+            return ahora - timedelta(days=int(dias)) if dias is not None else None
+
         self._proveedores = {}
-        for p in copy.deepcopy(seed.PROVEEDORES):
-            p["fecha_cambio_cuenta"] = ahora - timedelta(days=p.pop("cambio_cuenta_hace_dias"))
-            self._proveedores[p["proveedor_id"]] = p
-        self._ocs = {o["numero_oc"]: dict(o) for o in seed.ORDENES_COMPRA}
+        for p in copy.deepcopy(datos["proveedores"]):
+            fecha = p.get("fecha_cambio_cuenta") or hace(p.get("dias_desde_cambio_cuenta", p.get("cambio_cuenta_hace_dias")))
+            self._proveedores[str(p["proveedor_id"])] = {
+                "proveedor_id": str(p["proveedor_id"]), "razon_social": p["razon_social"], "nit": p.get("nit") or "",
+                "dominio": str(p["dominio"]).lower(), "banco": p.get("banco"), "cuenta": str(p["cuenta"]),
+                "telefono": p.get("telefono"), "fecha_cambio_cuenta": fecha,
+                "cambio_aprobado_por": p.get("cambio_aprobado_por")}
+        self._ocs = {str(o["numero_oc"]): {"numero_oc": str(o["numero_oc"]), "proveedor_id": str(o["proveedor_id"]),
+                                           "monto_cop": int(o["monto_cop"]), "factura": o.get("factura")}
+                     for o in datos["ordenes"]}
         self._historial = []
-        for h in copy.deepcopy(seed.HISTORIAL_PAGOS):
-            h["fecha"] = ahora - timedelta(days=h.pop("hace_dias"))
-            self._historial.append(h)
+        for h in copy.deepcopy(datos["historial"]):
+            self._historial.append({"pago_id": str(h["pago_id"]), "proveedor_id": str(h["proveedor_id"]),
+                                    "factura": h.get("factura"), "monto_cop": int(h["monto_cop"]),
+                                    "cuenta": h.get("cuenta"), "fecha": h.get("fecha") or hace(h.get("hace_dias"))})
         self._usuarios = {}
-        for u in seed.USUARIOS:
-            self._usuarios[u["usuario_id"]] = {
-                "usuario_id": u["usuario_id"], "nombre": u["nombre"], "rol": Rol(u["rol"]),
-                "pin_hash": _hash_pin(u["usuario_id"], u["pin"]),
+        for u in datos.get("usuarios") or seed.USUARIOS:  # personas de demo si la base no trae cfzt_usuarios
+            uid, pin = str(u["usuario_id"]), str(u["pin"])
+            self._usuarios[uid] = {
+                "usuario_id": uid, "nombre": u["nombre"], "rol": Rol(str(u["rol"]).strip().upper()),
+                "pin_hash": _hash_pin(uid, pin),
                 # Llave de firma personal simulada (en producción: HSM / llave del usuario).
-                "llave_firma": hashlib.sha256(f"llave|{u['usuario_id']}|{u['pin']}".encode()).digest(),
-                "pin_demo": u["pin"],
+                "llave_firma": hashlib.sha256(f"llave|{uid}|{pin}".encode()).digest(),
+                "pin_demo": pin,
             }
 
     # ---- proveedores ---------------------------------------------------------------
     def _a_info(self, p: dict | None) -> ProveedorInfo:
         if p is None:
             return ProveedorInfo(encontrado=False)
-        dias = (self._reloj() - p["fecha_cambio_cuenta"]).days
+        dias = (self._reloj() - p["fecha_cambio_cuenta"]).days if p["fecha_cambio_cuenta"] else None
         return ProveedorInfo(encontrado=True, proveedor_id=p["proveedor_id"], razon_social=p["razon_social"],
                              nit=p["nit"], dominio=p["dominio"], banco=p["banco"], cuenta_registrada=p["cuenta"],
                              telefono_registrado=p["telefono"], dias_desde_cambio_cuenta=dias,
@@ -73,14 +95,22 @@ class Repositorio:
         for p in self._proveedores.values():
             if nit and norm(nit) == norm(p["nit"]):
                 return self._a_info(p)
-        for p in self._proveedores.values():
-            if nombre and (norm(nombre) == norm(p["razon_social"])
-                           or norm(p["razon_social"]).startswith(norm(nombre)) and len(norm(nombre)) >= 8):
-                return self._a_info(p)
+        if nombre:
+            exactos = [p for p in self._proveedores.values() if norm(nombre) == norm(p["razon_social"])]
+            # Prefijo solo si es inequívoco: «Proveedor Corporativo 1» no debe elegir al 10, 11…
+            prefijos = [p for p in self._proveedores.values()
+                        if len(norm(nombre)) >= 8 and norm(p["razon_social"]).startswith(norm(nombre))]
+            if len(exactos) == 1:
+                return self._a_info(exactos[0])
+            if not exactos and len(prefijos) == 1:
+                return self._a_info(prefijos[0])
         for p in self._proveedores.values():
             if dominio and dominio.lower() == p["dominio"]:
                 return self._a_info(p)
         return ProveedorInfo(encontrado=False)
+
+    def cuentas_registradas(self) -> set[str]:
+        return {normalizar_cuenta(p["cuenta"]) for p in self._proveedores.values()}
 
     def dominios_registrados(self) -> list[str]:
         return [p["dominio"] for p in self._proveedores.values()]
@@ -112,7 +142,7 @@ class Repositorio:
                                           detalle=f"La factura {numero_factura} ya se pagó ({h['pago_id']})")
         for h in self._historial:
             if (proveedor_id and h["proveedor_id"] == proveedor_id and monto_cop == h["monto_cop"]
-                    and (self._reloj() - h["fecha"]).days <= 3 and not numero_factura):
+                    and h["fecha"] is not None and (self._reloj() - h["fecha"]).days <= 3 and not numero_factura):
                 return ResultadoDuplicado(duplicado=True, pago_previo_id=h["pago_id"],
                                           detalle="Mismo beneficiario y monto pagados hace menos de 3 días")
         return ResultadoDuplicado(duplicado=False, detalle="Sin pagos previos para esta factura")

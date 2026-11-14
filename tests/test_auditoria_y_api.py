@@ -49,11 +49,11 @@ def test_api_flujo_completo():
     sol = c.post("/api/correos", json=POR_ID["legitimo"]["correo"]).json()
     assert sol["pending_approval"] and sol["explicacion"]["pregunta_confirmacion"]
     r = c.post(f"/api/solicitudes/{sol['id']}/firmar", json={"usuario_id": "u-ana", "pin": "1111"})
-    assert r.status_code == 200 and r.json()["estado"] == "PENDIENTE_FIRMA_2"
-    r = c.post(f"/api/solicitudes/{sol['id']}/firmar", json={"usuario_id": "u-ana", "pin": "1111"})
-    assert r.status_code == 409
+    assert r.status_code == 409  # el Analista revisa pero no firma
     r = c.post(f"/api/solicitudes/{sol['id']}/firmar", json={"usuario_id": "u-tomas", "pin": "3333"})
     assert r.json()["estado"] == "EJECUTADA"
+    r = c.post(f"/api/solicitudes/{sol['id']}/firmar", json={"usuario_id": "u-tomas", "pin": "3333"})
+    assert r.status_code == 409
     e = c.get("/api/estado").json()
     assert e["kpis"]["operaciones_aprobadas"] == 1 and e["integridad"]["integro"]
 

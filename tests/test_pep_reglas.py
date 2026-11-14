@@ -51,10 +51,10 @@ def test_r5_sin_soporte_rechaza(enviar):
 
 
 @pytest.mark.parametrize("esc, regla, roles, telefono", [
-    ("legitimo", "R6", ["ANALISTA_CXP", "TESORERO"], False),
-    ("urgencia_legitima", "R7", ["ANALISTA_CXP", "TESORERO"], True),
-    ("monto_alto", "R8", ["ANALISTA_CXP", "TESORERO", "DIRECTOR_FINANCIERO"], False),
-    ("cuenta_modificada", "R9", ["ANALISTA_CXP", "TESORERO", "DIRECTOR_FINANCIERO"], True),
+    ("legitimo", "R6", ["TESORERO"], False),
+    ("urgencia_legitima", "R7", ["TESORERO"], True),
+    ("monto_alto", "R8", ["DIRECTOR_FINANCIERO"], False),
+    ("cuenta_modificada", "R9", ["DIRECTOR_FINANCIERO"], True),
 ])
 def test_rutas_de_firma(enviar, esc, regla, roles, telefono):
     v = enviar(esc)
@@ -76,44 +76,49 @@ def test_la_orden_usa_datos_del_maestro(enviar, svc):
 
 
 # ---------------------------------------------------------------- Capa 2: firmas
-def test_flujo_completo_doble_firma_ejecuta(enviar, svc):
+def test_flujo_completo_una_firma_ejecuta(enviar, svc):
     v = enviar("legitimo")
-    assert svc.firmar(v["id"], "u-ana", "1111")["estado"] == "PENDIENTE_FIRMA_2"
+    with pytest.raises(ErrorFirma, match="Se espera"):  # Cuentas por pagar revisa, no firma
+        svc.firmar(v["id"], "u-ana", "1111")
     r = svc.firmar(v["id"], "u-tomas", "3333")
     assert r["estado"] == "EJECUTADA"
     assert svc.pagos.saldo == svc.pagos.saldo_inicial - 1_250_000
     eventos = [e["evento"] for e in svc.audit.entradas if e["solicitud_id"] == v["id"]]
-    assert eventos[-4:] == ["FIRMA_1", "FIRMA_2", "ORDEN_PAGO", "EJECUTADA"]
+    assert eventos[-3:] == ["FIRMA_1", "ORDEN_PAGO", "EJECUTADA"]
 
 
 def test_sod_iniciador_no_firma(enviar, svc):
     v = enviar("orden_interna")
-    assert v["metadata"]["origen"] == "INTERNO_VERIFICADO"
+    assert v["metadata"]["origen"] == "INTERNO_VERIFICADO" and v["iniciado_por"] == "u-tomas"
     with pytest.raises(ErrorFirma, match="inició"):
-        svc.firmar(v["id"], "u-ana", "1111")
-    svc.firmar(v["id"], "u-andres", "2222")
-    assert svc.firmar(v["id"], "u-tomas", "3333")["estado"] == "EJECUTADA"
+        svc.firmar(v["id"], "u-tomas", "3333")
+    assert svc.firmar(v["id"], "u-teresa", "4444")["estado"] == "EJECUTADA"
 
 
 def test_sod_quien_aprobo_cambio_de_cuenta_no_firma_30_dias(enviar, svc):
+    svc.repo._proveedores["PROV-002"]["cambio_aprobado_por"] = "u-diana"  # la Directora aprobó el cambio
     v = enviar("cuenta_modificada")
-    svc.firmar(v["id"], "u-ana", "1111", verificacion_telefonica=True)
     with pytest.raises(ErrorFirma, match="cambio de cuenta"):
-        svc.firmar(v["id"], "u-teresa", "4444")
-    svc.firmar(v["id"], "u-tomas", "3333")
-    assert svc.firmar(v["id"], "u-diana", "5555")["estado"] == "EJECUTADA"
+        svc.firmar(v["id"], "u-diana", "5555", verificacion_telefonica=True)
+    assert svc.pagos.ejecutados == []
 
 
-def test_sod_misma_persona_no_firma_dos_veces(enviar, svc):
+def test_cuenta_reciente_la_firma_el_director_con_verificacion(enviar, svc):
+    v = enviar("cuenta_modificada")
+    with pytest.raises(ErrorFirma, match="Se espera la firma 1 de Director"):
+        svc.firmar(v["id"], "u-tomas", "3333")
+    assert svc.firmar(v["id"], "u-diana", "5555", verificacion_telefonica=True)["estado"] == "EJECUTADA"
+
+
+def test_una_vez_ejecutada_no_admite_mas_firmas(enviar, svc):
     v = enviar("monto_alto")
-    svc.firmar(v["id"], "u-ana", "1111")
-    with pytest.raises(ErrorFirma):
-        svc.firmar(v["id"], "u-ana", "1111")
+    svc.firmar(v["id"], "u-diana", "5555")
+    with pytest.raises(ErrorFirma, match="EJECUTADA"):
+        svc.firmar(v["id"], "u-diana", "5555")
 
 
 def test_verificacion_telefonica_obligatoria_antes_de_la_ultima_firma(enviar, svc):
     v = enviar("urgencia_legitima")
-    svc.firmar(v["id"], "u-ana", "1111")
     with pytest.raises(ErrorFirma, match="telefónica"):
         svc.firmar(v["id"], "u-tomas", "3333")
     assert svc.firmar(v["id"], "u-tomas", "3333", verificacion_telefonica=True)["estado"] == "EJECUTADA"
@@ -124,7 +129,7 @@ def test_verificacion_telefonica_obligatoria_antes_de_la_ultima_firma(enviar, sv
     ("agente:financiero", "0000", "Ningún agente"),
     ("u-ana", "0000", "MFA"),
     ("u-sofia", "6666", "Se espera"),
-    ("u-tomas", "3333", "Se espera la firma 1"),
+    ("u-ana", "1111", "Se espera la firma 1 de Tesorero"),
 ])
 def test_firmas_denegadas(enviar, svc, usuario, pin, patron):
     v = enviar("legitimo")
@@ -135,8 +140,7 @@ def test_firmas_denegadas(enviar, svc, usuario, pin, patron):
 
 def test_firma_cubre_hash_de_beneficiario_cuenta_monto(enviar, svc):
     v = enviar("legitimo")
-    svc.firmar(v["id"], "u-ana", "1111")
-    svc.pep.registros[v["id"]].monto_cop = 9_999_999  # manipulación posterior a la firma 1
+    svc.pep.registros[v["id"]].monto_cop = 9_999_999  # el monto cambia después de calcular el hash a firmar
     r = svc.firmar(v["id"], "u-tomas", "3333")
     assert r["estado"] == "BLOQUEADA" and "no cubre" in r["mensaje"]
     assert svc.pagos.ejecutados == []
@@ -166,9 +170,7 @@ def test_expiracion_48h():
     t = [datetime.now(timezone.utc)]
     s = FirewallService(persistir_auditoria=False, reloj=lambda: t[0])
     v = s.procesar_correo(CorreoEntrada(**POR_ID["legitimo"]["correo"]))
-    t[0] += timedelta(hours=47)
-    s.firmar(v["id"], "u-ana", "1111")
-    t[0] += timedelta(hours=2)
+    t[0] += timedelta(hours=49)
     with pytest.raises(ErrorFirma, match="EXPIRADA"):
         s.firmar(v["id"], "u-tomas", "3333")
     assert s.vista(v["id"])["estado"] == "EXPIRADA"

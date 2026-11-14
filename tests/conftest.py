@@ -4,7 +4,11 @@ import tempfile
 from pathlib import Path
 
 # Antes de importar `firewall`: LLM local (reproducible) y auditoría en un directorio temporal.
+os.environ["CFZT_SIN_ENV"] = "1"  # las pruebas no leen el .env del desarrollador
 os.environ["CFZT_LLM"] = "local"
+# Las pruebas unitarias usan los datos de demostración; la conexión SQL tiene su propia prueba.
+os.environ.pop("CFZT_DB_URL", None)
+os.environ.pop("CFZT_DB_SQL", None)
 os.environ["CFZT_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="cfzt-test-")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

@@ -41,6 +41,12 @@ ORDENES_COMPRA = [
     {"numero_oc": "OC-2026-0099", "proveedor_id": "PROV-004", "monto_cop": 850_000, "factura": "PC-319"},
     {"numero_oc": "OC-2026-0120", "proveedor_id": "PROV-001", "monto_cop": 1_250_000, "factura": "FV-8790"},
     {"numero_oc": "OC-2026-0171", "proveedor_id": "PROV-001", "monto_cop": 3_400_000, "factura": "FV-8840"},
+    {"numero_oc": "OC-2026-0180", "proveedor_id": "PROV-002", "monto_cop": 2_150_000, "factura": "SC-2310"},
+    {"numero_oc": "OC-2026-0182", "proveedor_id": "PROV-004", "monto_cop": 1_480_000, "factura": "PC-342"},
+    {"numero_oc": "OC-2026-0185", "proveedor_id": "PROV-003", "monto_cop": 4_700_000, "factura": "NA-7802"},
+    {"numero_oc": "OC-2026-0188", "proveedor_id": "PROV-001", "monto_cop": 2_600_000, "factura": "FV-8851"},
+    {"numero_oc": "OC-2026-0190", "proveedor_id": "PROV-004", "monto_cop": 760_000, "factura": "PC-350"},
+    {"numero_oc": "OC-2026-0193", "proveedor_id": "PROV-003", "monto_cop": 1_950_000, "factura": "NA-7810"},
 ]
 
 HISTORIAL_PAGOS = [

@@ -126,3 +126,127 @@ class PolicyEnforcementPoint:
             return deny(Reason.AMOUNT_MISMATCH, f"autorizado {a.amount_minor}, solicitado {args.amount_minor}",
                         a.auth_id)
         return deny(Reason.CURRENCY_MISMATCH, f"autorizado {a.currency}, solicitado {args.currency}", a.auth_id)
+
+
+# ==========================================================================================
+# UniversalPEP — reglas del núcleo (U0–U4), comunes a TODOS los dominios.
+#
+#   U0  Integridad y permisos: matriz agente→herramienta, esquema Pydantic cerrado, solicitud en
+#       curso y sello SHA-256 de las etiquetas del Sanitizer.
+#   U1  Contaminación + riesgo ALTO: contexto tainted con riesgo ALTO no puede invocar herramientas
+#       CRITICA_IRREVERSIBLE ni COMUNICACION_EXTERNA → BLOQUEADA + alerta.
+#   U2  Autenticación de origen fallida (SPF/DKIM/DMARC, HMAC de webhook) o suplantación → BLOQUEADA.
+#   U3  Herramienta CRITICA_IRREVERSIBLE desde contexto tainted: nunca se ejecuta sola; queda
+#       PENDING_APPROVAL atada a hash_accion = sha256(dominio + herramienta + args canónicos).
+#   U4  Segregación de funciones: quien inicia no aprueba, nadie firma dos veces, los
+#       administradores de plataforma y los agentes de IA no aprueban operaciones de negocio.
+#
+# Las reglas de cada industria (pagos R1–R9, DevOps D1–D5) viven en los Policy Packs.
+# ==========================================================================================
+import hashlib as _hashlib  # noqa: E402
+import json as _json  # noqa: E402
+from dataclasses import dataclass as _dataclass  # noqa: E402
+from dataclasses import field as _field  # noqa: E402
+
+from pydantic import ValidationError as _ValidationError  # noqa: E402
+
+from .contracts import NivelImpacto, ToolManifest  # noqa: E402
+
+REGLAS_UNIVERSALES = {
+    "U0": "Integridad y permisos (matriz agente→herramienta, esquema cerrado, sello SHA-256 de etiquetas)",
+    "U1": "Contexto contaminado con riesgo ALTO no puede invocar herramientas críticas o de comunicación externa",
+    "U2": "Autenticación de origen fallida o suplantación de identidad",
+    "U3": "Acción crítica desde contexto no confiable: requiere aprobación humana atada al hash de la acción",
+    "U4": "Segregación de funciones en la aprobación",
+}
+IMPACTOS_PROTEGIDOS_U1 = frozenset({NivelImpacto.CRITICA_IRREVERSIBLE, NivelImpacto.COMUNICACION_EXTERNA})
+
+
+def hash_accion(dominio: str, herramienta: str, args: Mapping[str, Any]) -> str:
+    canon = _json.dumps({k: args[k] for k in sorted(args)}, sort_keys=True, ensure_ascii=False, default=str,
+                        separators=(",", ":"))
+    return _hashlib.sha256(f"{dominio}|{herramienta}|{canon}".encode()).hexdigest()
+
+
+@_dataclass(frozen=True)
+class ReglaCore:
+    codigo: str          # U0..U4
+    descripcion: str
+    decision: str        # BLOQUEADA | FIRMAS
+
+
+@_dataclass
+class ResultadoCore:
+    args: Any = None                     # argumentos validados (instancia del esquema del manifiesto)
+    manifiesto: ToolManifest | None = None
+    reglas: list[ReglaCore] = _field(default_factory=list)
+    requiere_humano: bool = False        # U3
+    integridad_fallida: bool = False     # U0 (corta la evaluación)
+
+    @property
+    def bloqueada(self) -> bool:
+        return any(r.decision == "BLOQUEADA" for r in self.reglas)
+
+
+class UniversalPEP:
+    """Motor determinista del núcleo. No conoce pagos, proveedores ni servidores."""
+
+    def __init__(self, dominio: str, permisos: Mapping[str, frozenset[str]],
+                 manifiestos: Mapping[str, ToolManifest]) -> None:
+        self.dominio = dominio
+        self._permisos = permisos
+        self._manifiestos = manifiestos
+
+    def evaluar_core(self, agente: str, herramienta: str, args: Any, *, solicitud_id: str, tainted: bool,
+                     nivel_riesgo: str, autenticacion_origen_valida: bool, suplantacion: str | None,
+                     sello_valido: bool) -> ResultadoCore:
+        res = ResultadoCore()
+
+        def u0(detalle: str) -> ResultadoCore:
+            res.reglas.append(ReglaCore("U0", detalle, "BLOQUEADA"))
+            res.integridad_fallida = True
+            return res
+
+        if herramienta not in self._permisos.get(agente, frozenset()):
+            return u0(f"{agente} no tiene permiso para {herramienta} (Matriz 1)")
+        manifiesto = self._manifiestos.get(herramienta)
+        if manifiesto is None:
+            return u0(f"{herramienta} no tiene manifiesto registrado en el ToolGateway")
+        res.manifiesto = manifiesto
+        try:
+            res.args = manifiesto.esquema_args.model_validate(args)
+        except _ValidationError as e:
+            return u0(f"Argumentos fuera del esquema cerrado ({e.error_count()} errores)")
+        if getattr(res.args, "solicitud_id", solicitud_id) != solicitud_id:
+            return u0("La propuesta no corresponde a la solicitud en curso")
+        if not sello_valido:
+            return u0("Las etiquetas del Sanitizer fueron alteradas después de selladas")
+
+        impacto = manifiesto.nivel_impacto
+        if tainted and nivel_riesgo == "ALTO" and impacto in IMPACTOS_PROTEGIDOS_U1:
+            res.reglas.append(ReglaCore("U1", f"Contexto no confiable con riesgo ALTO invoca una herramienta "
+                                              f"{impacto.value}", "BLOQUEADA"))
+        if not autenticacion_origen_valida:
+            res.reglas.append(ReglaCore("U2", "El origen no superó la autenticación (SPF/DKIM/DMARC o firma HMAC)",
+                                        "BLOQUEADA"))
+        if suplantacion:
+            res.reglas.append(ReglaCore("U2", f"Suplantación de identidad: {suplantacion}", "BLOQUEADA"))
+        res.requiere_humano = (impacto is NivelImpacto.CRITICA_IRREVERSIBLE and tainted
+                               and manifiesto.requiere_aprobacion_humana_si_tainted)
+        return res
+
+    @staticmethod
+    def verificar_sod(firmante: str, *, iniciado_por: str | None, firmantes_previos: list[str],
+                      es_admin_plataforma: bool) -> str | None:
+        """U4. Devuelve el motivo de la denegación o None."""
+        if es_admin_plataforma:
+            return "Administradores de plataforma no pueden aprobar operaciones de negocio (ISO 27001 8.2)"
+        if firmante == iniciado_por:
+            return "Segregación de funciones: quien inició la solicitud no puede firmarla (ISO 27001 5.3)"
+        if firmante in firmantes_previos:
+            return "Segregación de funciones: una persona no puede firmar dos veces la misma solicitud"
+        return None
+
+    @staticmethod
+    def es_identidad_de_agente(usuario_id: str) -> bool:
+        return usuario_id.startswith("agente")

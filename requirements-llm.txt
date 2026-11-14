@@ -1,3 +1,4 @@
-# Opcionales: solo si CFZT_LLM=groq o CFZT_LLM=gemini (DECISIONES_DISENO.md, P1)
+# Opcionales: solo si CFZT_LLM=ollama, groq o gemini (DECISIONES_DISENO.md, P1)
+langchain-ollama>=0.3
 langchain-groq>=0.2
 langchain-google-genai>=2.0

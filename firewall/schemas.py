@@ -45,6 +45,7 @@ class Estado(StrEnum):
     PENDIENTE_FIRMA_3 = "PENDIENTE_FIRMA_3"
     EJECUTADA = "EJECUTADA"
     EXPIRADA = "EXPIRADA"
+    FALLO_MODELO = "FALLO_MODELO"  # modo estricto: el modelo real falló; no se paga ni se usa simulador
 
 
 ESTADOS_PENDIENTES = frozenset({Estado.PENDIENTE_FIRMA_1, Estado.PENDIENTE_FIRMA_2, Estado.PENDIENTE_FIRMA_3})
@@ -62,9 +63,20 @@ class CorreoEntrada(_Cerrado):
     spf: ResultadoAuth = "pass"
     dkim: ResultadoAuth = "pass"
     dmarc: ResultadoAuth = "pass"
-    canal: Literal["EMAIL_EXTERNO", "CANAL_INTERNO"] = "EMAIL_EXTERNO"
+    canal: Literal["EMAIL_EXTERNO", "CANAL_INTERNO", "WEBHOOK_GITHUB", "TICKET_SOPORTE", "API_A2A"] = "EMAIL_EXTERNO"
     iniciado_por: str | None = Field(default=None, max_length=40)   # solo canal interno
     token_interno: str | None = Field(default=None, max_length=80)  # solo canal interno
+
+    def a_envelope(self):
+        """Adaptador hacia el sobre universal del núcleo (cfzt.contracts.ContextEnvelope)."""
+        from cfzt.contracts import ContextEnvelope
+        canal = {"EMAIL_EXTERNO": "email", "CANAL_INTERNO": "interno", "WEBHOOK_GITHUB": "webhook_github",
+                 "TICKET_SOPORTE": "ticket_soporte", "API_A2A": "api_a2a"}[self.canal]
+        return ContextEnvelope(
+            canal=canal, remitente_o_actor=self.remitente, asunto_o_titulo=self.asunto, contenido_crudo=self.cuerpo,
+            adjunto_o_payload=self.adjunto_texto,
+            autenticacion_origen_valida=self.spf == "pass" and self.dkim == "pass" and self.dmarc == "pass",
+            iniciado_por=self.iniciado_por)
 
 
 # --- Agente A: Recepcionista --------------------------------------------------------
@@ -111,7 +123,7 @@ class ClasificacionSemantica(_Cerrado):
 
 class DecisionRelevancia(_Cerrado):
     requiere_accion_financiera: bool
-    categoria: Literal["SOLICITUD_PAGO", "INFORMATIVA", "OFF_TOPIC", "SPAM"]
+    categoria: Literal["SOLICITUD_PAGO", "SOLICITUD_CAMBIO", "INFORMATIVA", "OFF_TOPIC", "SPAM"]
     justificacion: str = Field(max_length=300)
 
 
@@ -189,19 +201,27 @@ class VeredictoPEP(_Cerrado):
     estado: Estado
     regla_principal: str
     reglas: tuple[ReglaActivada, ...] = ()
-    firmas_requeridas: tuple[Rol, ...] = ()
+    firmas_requeridas: tuple[str, ...] = ()  # roles (Rol o RolDevOps)
     verificacion_telefonica: bool = False
     telefono_registrado: str | None = None
     alerta_seguridad: bool = False
     hash_transaccion: str | None = None
     latencia_ms: float = 0.0
     pep_activo: bool = True
+    control: Literal["PEP", "SANITIZER", "LLM", "NINGUNO"] = "PEP"  # qué componente tomó la decisión
+
+
+class VeredictoVerificadorLLM(_Cerrado):
+    """Salida del verificador único del modo SOLO_LLM (línea base «LLM-como-juez»)."""
+    decision: Literal["APROBAR", "BLOQUEAR"]
+    nivel_riesgo: NivelRiesgo
+    motivo: str = Field(max_length=400)
 
 
 class Firma(_Cerrado):
     usuario_id: str
     nombre: str
-    rol: Rol
+    rol: str
     hash_transaccion: str
     timestamp: datetime
     firma_hmac: str
@@ -232,5 +252,10 @@ class PeticionRechazo(_Cerrado):
     motivo: str = Field(default="", max_length=300)
 
 
+class PeticionPack(_Cerrado):
+    pack: Literal["pagos_iso42001", "devops_cloud"]
+
+
 class PeticionModo(_Cerrado):
-    pep_activo: bool
+    pep_activo: bool | None = None  # interruptor de la demo (COMPLETO / SIN_DEFENSA)
+    modo: Literal["COMPLETO", "SOLO_PEP", "SOLO_SANITIZER", "SOLO_LLM", "SIN_DEFENSA"] | None = None

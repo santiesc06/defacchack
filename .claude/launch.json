@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cfzt",
+      "runtimeExecutable": ".venv/Scripts/python.exe",
+      "runtimeArgs": ["start.py", "--sin-navegador", "--puerto", "8765"],
+      "port": 8765
+    }
+  ]
+}

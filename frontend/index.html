@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Context Firewall Zero-Trust</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M16 2 4 7v8c0 7.2 5.1 13.4 12 15 6.9-1.6 12-7.8 12-15V7L16 2Z" fill="currentColor"/><path d="m11 16 3.5 3.5L21.5 12" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div>
+        <div class="brand-name">Context Firewall <span>Zero-Trust</span></div>
+        <div class="brand-sub">Pagos autónomos desde correo · PEP determinista + supervisión humana</div>
+      </div>
+    </div>
+    <div class="topbar-controls">
+      <label class="pep-switch" id="pepSwitch">
+        <input type="checkbox" id="pepToggle" checked />
+        <span class="track"><span class="thumb"></span></span>
+        <span class="pep-label"><b>PEP Zero-Trust</b> <span id="pepState">ACTIVADO</span></span>
+      </label>
+      <span class="pill pill-muted" id="llmPill" title="Proveedor de LLM">LLM: —</span>
+      <button class="btn btn-ghost" id="btnReset">Reiniciar demo</button>
+    </div>
+  </header>
+
+  <div class="banner-off" id="bannerOff" hidden>
+    Modo <b>confianza implícita</b>: la herramienta del Agente Financiero va directo al servicio de pagos — sin reglas, sin firmas, sin confirmación humana.
+  </div>
+
+  <section class="kpis">
+    <article class="kpi">
+      <div class="kpi-label">Saldo empresarial</div>
+      <div class="kpi-value mono" id="kpiSaldo">—</div>
+      <div class="kpi-sub" id="kpiSaldoSub">COP</div>
+    </article>
+    <article class="kpi kpi-danger">
+      <div class="kpi-label">Ataques bloqueados por PEP</div>
+      <div class="kpi-value" id="kpiBloq">0</div>
+      <div class="kpi-sub" id="kpiBloqSub">0 bloqueadas · 0 rechazadas</div>
+    </article>
+    <article class="kpi kpi-info">
+      <div class="kpi-label">Accesos evitados por Orquestador</div>
+      <div class="kpi-value" id="kpiEvit">0</div>
+      <div class="kpi-sub">Agente Financiero aislado · mínimo privilegio</div>
+    </article>
+    <article class="kpi kpi-ok">
+      <div class="kpi-label">Operaciones aprobadas</div>
+      <div class="kpi-value" id="kpiAprob">0</div>
+      <div class="kpi-sub" id="kpiAprobSub">0 pendientes de firma</div>
+    </article>
+  </section>
+
+  <main class="grid">
+    <!-- ============ COLUMNA 1 ============ -->
+    <section class="col">
+      <div class="col-head">
+        <div class="col-kicker">Mundo exterior</div>
+        <h2>Bandeja de entrada externa</h2>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Escenarios rápidos <span class="hint">1 clic = cargar y enviar</span></div>
+        <ul class="inbox" id="inbox"></ul>
+      </div>
+
+      <form class="card compose" id="compose" autocomplete="off">
+        <div class="card-title">Redactar correo entrante <span class="hint">editable</span></div>
+        <div class="row2">
+          <label>Canal
+            <select name="canal" id="fCanal">
+              <option value="EMAIL_EXTERNO">Correo externo</option>
+              <option value="CANAL_INTERNO">Canal interno (ERP)</option>
+            </select>
+          </label>
+          <label>Nombre remitente<input name="nombre_remitente" /></label>
+        </div>
+        <label>Remitente<input name="remitente" required placeholder="facturacion@proveedor.com" /></label>
+        <label>Asunto<input name="asunto" required /></label>
+        <label>Cuerpo<textarea name="cuerpo" rows="5" required></textarea></label>
+        <details class="attach">
+          <summary>Adjunto simulado</summary>
+          <label>Nombre<input name="adjunto_nombre" placeholder="factura.pdf" /></label>
+          <label>Texto extraído del adjunto<textarea name="adjunto_texto" rows="3"></textarea></label>
+        </details>
+        <div class="row3">
+          <label>SPF<select name="spf"><option>pass</option><option>fail</option><option>none</option></select></label>
+          <label>DKIM<select name="dkim"><option>pass</option><option>fail</option><option>none</option></select></label>
+          <label>DMARC<select name="dmarc"><option>pass</option><option>fail</option><option>none</option></select></label>
+        </div>
+        <div class="row2" id="internoFields" hidden>
+          <label>Iniciado por<input name="iniciado_por" placeholder="u-ana" /></label>
+          <label>Token canal interno<input name="token_interno" /></label>
+        </div>
+        <button class="btn btn-primary btn-block" type="submit" id="btnEnviar">Enviar al Agente Recepcionista →</button>
+      </form>
+    </section>
+
+    <!-- ============ COLUMNA 2 ============ -->
+    <section class="col">
+      <div class="col-head">
+        <div class="col-kicker">Pasillo interno A2A · LangGraph</div>
+        <h2>Trazabilidad del grafo</h2>
+      </div>
+      <div class="pipeline" id="pipeline">
+        <div class="empty">Envía un correo o elige un escenario para ver cómo viaja por el grafo.</div>
+      </div>
+    </section>
+
+    <!-- ============ COLUMNA 3 ============ -->
+    <section class="col">
+      <div class="col-head">
+        <div class="col-kicker">Aduana · supervisión humana · banco</div>
+        <h2>PEP y decisión humana</h2>
+      </div>
+
+      <div class="card verdict" id="verdict">
+        <div class="card-title">Veredicto del PEP <span class="hint">código determinista, sin LLM</span></div>
+        <div class="empty">En espera. Toda llamada a <code>solicitar_ejecucion_pago</code> pasa por aquí antes de tocar los fondos.</div>
+      </div>
+
+      <div class="card hitl" id="hitl">
+        <div class="card-title">Resumen ejecutivo para el trabajador
+          <select id="selSolicitud" class="mini-select" title="Cambiar de solicitud"></select>
+        </div>
+        <div class="empty">Aquí aparecerá la explicación del Agente Explicador y la confirmación humana.</div>
+      </div>
+
+      <div class="card bank">
+        <div class="card-title">Banco simulado <span class="pill pill-ok" id="bankPill">PROTEGIDO</span></div>
+        <div class="bank-row">
+          <div><div class="kpi-label">Saldo</div><div class="bank-saldo mono" id="bankSaldo">—</div></div>
+          <div class="right"><div class="kpi-label">Desviado a cuentas no registradas</div><div class="bank-desv mono" id="bankDesv">$0 COP</div></div>
+        </div>
+        <ul class="pagos" id="pagos"></ul>
+      </div>
+
+      <div class="card audit">
+        <div class="card-title">Registro de auditoría inmutable <span class="pill" id="integrityPill">—</span></div>
+        <div class="audit-actions">
+          <button class="btn btn-ghost btn-sm" id="btnVerify">Verificar cadena SHA-256</button>
+          <button class="btn btn-ghost btn-sm danger" id="btnTamper">Simular manipulación</button>
+        </div>
+        <ol class="audit-list mono" id="auditList"></ol>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

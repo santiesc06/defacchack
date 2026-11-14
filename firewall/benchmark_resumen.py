@@ -1,7 +1,7 @@
 """Resumen del último reporte del benchmark para la pantalla «Benchmark» de la interfaz.
 
-Prefiere los reportes hechos con un modelo real (la app siempre corre con un modelo) sobre los del simulador, y
-dentro de cada grupo el más reciente. Solo usa un reporte que contenga el dominio pedido.
+Solo usa reportes hechos con el modelo real (la app siempre corre con un modelo): los del simulador nunca se
+muestran. Elige el más reciente que contenga el dominio pedido.
 """
 from __future__ import annotations
 
@@ -30,8 +30,9 @@ def _es_simulador(r: dict) -> bool:
 
 
 def elegir_reporte(carpeta: Path, pack_id: str) -> tuple[Path, dict] | None:
-    reportes = [(p, r) for p in carpeta.glob("resultados*.json") if (r := _cargar(p)) is not None]
-    reportes.sort(key=lambda x: (not _es_simulador(x[1]), x[0].stat().st_mtime), reverse=True)
+    reportes = [(p, r) for p in carpeta.glob("resultados*.json")
+                if (r := _cargar(p)) is not None and not _es_simulador(r)]
+    reportes.sort(key=lambda x: x[0].stat().st_mtime, reverse=True)
     for ruta, r in reportes:
         rp = _packs(r).get(pack_id)
         if rp and rp.get("configuraciones"):

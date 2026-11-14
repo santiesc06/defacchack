@@ -141,7 +141,7 @@ function adaptar(v){
     correo:interno?null:{de:c.remitente,para:D().buzon,asunto:c.asunto||"(sin asunto)",cuerpo:cuerpoConSenales(c.cuerpo||"",evid),adj:c.adjunto_nombre||null,oculto:c.adjunto_texto||null,evid},
     asunto:c.asunto||"",cmp:filasComparacion(v,ext,val,meta),ext,val,meta,dv,
     firmo:firma?firma.usuario_id:null,firmoNombre:firma?firma.nombre:null,firmoRol:firma?firma.rol:null,firmaHora:firma?fechaTxt(firma.timestamp):null,firma,
-    rechazoPor:rech?rech.actor.replace("humano:",""):null,motivo:rech?(rech.payload||{}).motivo:null,
+    revisado:(v.eventos||[]).some(e=>e.evento==="INCIDENTE_REVISADO"),rechazoPor:rech?rech.actor.replace("humano:",""):null,motivo:rech?(rech.payload||{}).motivo:null,
     eventos:v.eventos||[],modo:v.modo,financiero:v.financiero_invocado,sello:san.sello_sha256,hash:dv.hash_transaccion,alerta:!!ver.alerta_seguridad
   };
 }
@@ -165,10 +165,11 @@ async function cargar(){
 function canSign(id){
   const s=S[id],p=P();
   if(!pending(s)){
-    const r={BLOQUEADA:["El PEP bloqueó esta solicitud y avisó al Oficial de Seguridad. No admite firma.","ent"],EJECUTADA:[`Esta solicitud ya se ejecutó (${D().ok.toLowerCase()}).`,"log"],RECHAZADA:["Esta solicitud fue rechazada; no admite firma.","log"],EXPIRADA:["Pasaron 48 h sin firma. Debe iniciarse una solicitud nueva.","log"],CERRADA_NO_FINANCIERA:["El orquestador la cerró: el mensaje no pide ninguna acción.","acc"],FALLO_MODELO:["El modelo falló (modo estricto): no se ejecuta nada.","trz"]}[s.estado]||["No está pendiente de firma.","log"];
+    const r={BLOQUEADA:[s.revisado?"El PEP la bloqueó y el Oficial de Seguridad ya abrió el caso. No admite firma.":"El PEP la bloqueó: no admite firma. Solo el Oficial de Seguridad puede revisar el incidente (cambia de persona arriba a la derecha).","ent"],EJECUTADA:[`Esta solicitud ya se ejecutó (${D().ok.toLowerCase()}).`,"log"],RECHAZADA:["Esta solicitud fue rechazada; no admite firma.","log"],EXPIRADA:["Pasaron 48 h sin firma. Debe iniciarse una solicitud nueva.","log"],CERRADA_NO_FINANCIERA:["El orquestador la cerró: el mensaje no pide ninguna acción.","acc"],FALLO_MODELO:["El modelo falló (modo estricto): no se ejecuta nada.","trz"]}[s.estado]||["No está pendiente de firma.","log"];
     return {ok:false,show:p.rol!=="auditor",why:r[0],iso:r[1]};
   }
   if(p.rol==="auditor") return {ok:false,show:false,why:"Vista de solo lectura · Auditor.",iso:"acc"};
+  if(p.rol==="oficial") return {ok:false,show:true,why:`El Oficial de Seguridad no firma operaciones. Esta la firma: ${s.rolSigTxt}.`,iso:"sod"};
   if(p.rol==="admin") return {ok:false,show:true,why:"La administración de la plataforma no puede firmar operaciones (ISO 27001 8.2).",iso:"sod"};
   if(s.ini===p.id) return {ok:false,show:true,why:"Tú iniciaste esta solicitud. Por segregación de funciones debe firmarla otra persona.",iso:"sod"};
   if(s.rolSig!==p.backendRol) return {ok:false,show:true,why:`Esta solicitud la firma: ${s.rolSigTxt}. ${s.tipo?"Regla "+esc(s.tipo)+".":""}`,iso:"sod"};
@@ -185,6 +186,7 @@ function whoSigns(id){
   if(s.ini===P().id) return ["La iniciaste tú · firma otra persona",""];
   return [`Le corresponde a: ${esc(s.rolSigTxt)}`,""];
 }
+const canReview=id=>S[id].estado==="BLOQUEADA"&&P().backendRol==="OFICIAL_SEGURIDAD"&&!S[id].revisado;
 const canReject=id=>pending(S[id])&&PUEDEN_RECHAZAR.has(P().backendRol)&&S[id].ini!==P().id;
 const canExport=()=>["DIRECTOR_FINANCIERO","AUDITOR","LIDER_SRE","OFICIAL_SEGURIDAD"].includes(P().backendRol);
 
@@ -225,7 +227,7 @@ function vBandeja(){
   crumbs([["Bandeja","#bandeja"]]);
   const firmante=p.rol==="firmante";
   const title=firmante?"Pendientes de mi firma":p.rol==="auditor"?"Bandeja · solo lectura":"Solicitudes";
-  const sub=firmante?"Lo que espera tu firma, ordenado por llegada. Solo una persona firma cada solicitud.":p.rol==="auditor"?"Ves todo, sin acciones de firma.":"Prepara, revisa y devuelve. La firma la hace el rol que exige el PEP.";
+  const sub=firmante?"Lo que espera tu firma, ordenado por llegada. Solo una persona firma cada solicitud.":p.rol==="auditor"?"Ves todo, sin acciones de firma. Para firmar o rechazar, cambia de persona arriba a la derecha.":"Prepara, revisa y devuelve. La firma la hace el rol que exige el PEP.";
   const mine=ORDER.filter(id=>canSign(id).ok);
   const soon=ORDER.filter(id=>pending(S[id])&&S[id].vence<12);
   const blk=ORDER.filter(id=>S[id].estado==="BLOQUEADA");
@@ -303,9 +305,10 @@ function vExpediente(id){
      <div class="actions"><div class="row">
        ${!pending(s)?`<a class="btn" href="#registro-${id}">${ic("i-doc")}Ver registro</a>`:""}
        ${canReject(id)?`<button class="btn danger lg" data-act="reject" data-id="${id}">${ic("i-x")}No aprobar</button>`:""}
+       ${canReview(id)?`<button class="btn lg" data-act="incidente" data-id="${id}">${ic("i-shield")}Revisar incidente</button>`:""}
        ${signBtn}</div>
        ${c.show&&!c.ok?`<div class="why-dis" id="whydis">${ic("i-lock")}<span>${c.why} <span class="iso" style="margin-left:4px">${ISO[c.iso].split(" ").slice(0,2).join(" ")}</span></span></div>`:""}
-       ${auditor?`<div class="why-dis" style="border-color:var(--accent)">${ic("i-doc")}<span>Vista de solo lectura · Auditor</span></div>`:""}
+       ${auditor?`<div class="why-dis" style="border-color:var(--accent)">${ic("i-doc")}<span>Vista de solo lectura · Auditor. Cambia de persona arriba a la derecha para firmar o rechazar.</span></div>`:""}
      </div>
    </div>
    <div class="why ${whyCls}"><span class="ic">${ic(whyIc)}</span><div><span class="lbl">Por qué${s.explicacion.resumen?" · explicación del agente explicador":s.estado==="CERRADA_NO_FINANCIERA"?" · justificación del orquestador":""}${s.explicacion.recomendacion?` · recomienda ${esc(s.explicacion.recomendacion.replace("_"," ").toLowerCase())}`:""}</span><p>${esc(s.porque)}</p>${s.explicacion.pregunta_confirmacion&&pending(s)?`<p style="margin-top:6px"><b>${esc(s.explicacion.pregunta_confirmacion)}</b></p>`:""}<div class="isos">${s.iso.map(isoTag).join("")}</div></div></div>
@@ -455,7 +458,7 @@ const nde=(p,n)=>p==null||!n?"":`${Math.round(p*n/100)} de ${n}`;
 const MODO_TXT={COMPLETO:"Sanitizer + PEP",SOLO_PEP:"Solo PEP",SOLO_SANITIZER:"Solo Sanitizer",SOLO_LLM:"Solo modelo verificador",SIN_DEFENSA:"Sin defensa"};
 function vBenchmark(){
   crumbs([["Benchmark",""]]);
-  if(!BENCH) return `<div class="page"><div class="ph"><div><h1>¿Cómo le fue al firewall?</h1></div></div><div class="card"><div class="state err">${ic("i-alert","big")}<h3>No encontramos resultados de la batería</h3><p>${esc(BENCH_ERR||"Todavía no hay una ejecución registrada.")} La batería corre fuera de la app (<span class="mono">python evaluacion_empirica.py</span>); cuando termine, los resultados aparecen aquí.</p><button class="btn" data-act="retry-b">${ic("i-refresh")}Volver a cargar</button></div></div></div>`;
+  if(!BENCH) return `<div class="page"><div class="ph"><div><h1>¿Cómo le fue al firewall?</h1></div></div><div class="card"><div class="state err">${ic("i-alert","big")}<h3>No encontramos resultados de la batería</h3><p>${esc(BENCH_ERR||"Todavía no hay una ejecución registrada.")} Esta pantalla solo muestra resultados del modelo real. Ejecuta <span class="mono">.venv/Scripts/python evaluacion_empirica.py --llm ollama --modelo qwen2.5:7b</span>; cuando termine, los porcentajes aparecen aquí.</p><button class="btn" data-act="retry-b">${ic("i-refresh")}Volver a cargar</button></div></div></div>`;
   const B=BENCH,cf=B.configuraciones||{},C=cf.COMPLETO||{},SD=cf.SIN_DEFENSA||{},n=B.n||{};
   const nA=n.ATAQUE||0,nL=n.LEGITIMO||0;
   const blq=Math.round((C.tasa_bloqueo_ataques_pct||0)*nA/100),noDet=nA-blq;
@@ -552,8 +555,9 @@ function paneBody(id){
   let foot="";
   if(c.ok||canReject(id)) foot+=`<div class="row">${canReject(id)?`<button class="btn danger" data-act="reject" data-id="${id}">${ic("i-x")}No aprobar</button>`:""}${c.ok?`<button class="btn pri" data-act="pane-start" data-id="${id}">${ic("i-pen")}Firmar</button>`:`<button class="btn is-dis" disabled>${ic("i-lock")}Firmar</button>`}</div>`;
   else if(c.show) foot+=`<button class="btn is-dis" disabled>${ic("i-lock")}Firmar</button>`;
+  if(canReview(id)) foot+=`<button class="btn" data-act="incidente" data-id="${id}">${ic("i-shield")}Revisar incidente</button>`;
   if(!c.ok&&c.show) foot+=`<div class="why-dis">${ic("i-lock")}<span>${c.why}</span></div>`;
-  if(P().rol==="auditor") foot+=`<div class="why-dis" style="border-color:var(--accent)">${ic("i-doc")}<span>Vista de solo lectura · Auditor</span></div>`;
+  if(P().rol==="auditor") foot+=`<div class="why-dis" style="border-color:var(--accent)">${ic("i-doc")}<span>Vista de solo lectura · Auditor. Cambia de persona para firmar o rechazar.</span></div>`;
   foot+=`<a class="lnk" href="#solicitud-${id}" style="font-size:13px">Abrir expediente completo ›</a>`;
   return [body,foot];
 }
@@ -597,6 +601,9 @@ function renderDPanel(){
    <p class="muted" style="font-size:12px">Integridad del registro: ${INTEG?(INTEG.integro?`íntegro · ${INTEG.entradas} entradas`:`<b style="color:var(--crit)">${esc(INTEG.detalle)}</b>`):"—"}</p>`;
 }
 async function enviarEscenarios(lista){
+  // El dominio activo es estado del servidor: si otra pestaña o proceso lo cambió, se alinea antes de enviar.
+  try{const e=await api("/api/estado");if(e.pack.id!==PACK())await api("/api/pack",{method:"POST",body:{pack:PACK()}});}
+  catch(err){toast(esc(err.message),"i-alert");return;}
   for(let i=0;i<lista.length;i++){
     const e=lista[i];ui.busy=`Procesando ${i+1} de ${lista.length}: ${e.etiqueta}…`;renderDPanel();rerender();
     try{const r=await api("/api/correos",{method:"POST",body:e.correo});toast(`${esc(e.etiqueta)} → ${esc(r.estado)}`,r.estado==="BLOQUEADA"?"i-lock":"i-check");}
@@ -664,6 +671,7 @@ document.addEventListener("click",async e=>{
     rerender();
   }
   if(a==="reject") openReject(t.dataset.id);
+  if(a==="incidente") openReject(t.dataset.id,"incidente");
   if(a==="pane-toggle"){ui.paneOpen=ui.paneOpen===false;rerender();}
   if(a==="pane-start"){ui.pane={id:t.dataset.id,step:1,err:null,checked:false};rerender();}
   if(a==="pane-cancel"){ui.pane=null;rerender();}
@@ -713,15 +721,19 @@ $("#presenter").addEventListener("click",presenter);
 /* Tema */
 function applyThemeIcon(){const dark=document.documentElement.dataset.theme==="dark"||(!document.documentElement.dataset.theme&&matchMedia("(prefers-color-scheme: dark)").matches);$("#theme").innerHTML=ic(dark?"i-sun":"i-moon");$("#theme").title=dark?"Cambiar a modo claro":"Cambiar a modo oscuro";}
 $("#theme").addEventListener("click",()=>{const dark=document.documentElement.dataset.theme==="dark"||(!document.documentElement.dataset.theme&&matchMedia("(prefers-color-scheme: dark)").matches);document.documentElement.dataset.theme=dark?"light":"dark";applyThemeIcon();});
-/* Modal No aprobar (con PIN: el rechazo también queda firmado en el registro) */
-function openReject(id){
-  const n=(P().pin||"0000").length;
-  $("#modal-root").innerHTML=`<div class="scrim" id="scrim"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="mt"><h2 id="mt">No aprobar ${id}</h2><p class="muted" style="margin:0">La solicitud pasará a <b>Rechazada</b>. Escribe el motivo; quedará en el registro SHA-256 con tu identidad.</p><label class="lbl" for="motivo">Motivo (obligatorio)</label><textarea id="motivo" placeholder="Ej.: el monto no coincide con lo acordado en la OC"></textarea><label class="lbl" for="rpin">Tu PIN (${n} dígitos · demo: ${esc(P().pin)})</label><input id="rpin" inputmode="numeric" maxlength="${n}" style="font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);width:120px;letter-spacing:4px"><div id="merr"></div><div class="foot"><span class="sp"></span><button class="btn" id="mcancel">Cancelar</button><button class="btn danger" id="mok" style="background:var(--crit);color:var(--surface);border-color:var(--crit)">${ic("i-x")}No aprobar</button></div></div></div>`;
+/* Modal con PIN: «No aprobar» (pendiente) o «Revisar incidente» (bloqueada, solo Oficial de Seguridad).
+   Las dos acciones quedan en el registro SHA-256 con la identidad de quien las hizo. */
+function openReject(id,modo="rechazar"){
+  const n=(P().pin||"0000").length;const inc=modo==="incidente";
+  const tit=inc?`Revisar incidente ${id}`:`No aprobar ${id}`;
+  const txt=inc?"Se abre un caso de seguridad. La solicitud <b>sigue bloqueada</b>: reabrirla exige un caso nuevo (procedimiento 2.2).":"La solicitud pasará a <b>Rechazada</b>. Escribe el motivo; quedará en el registro SHA-256 con tu identidad.";
+  const btn=inc?`${ic("i-shield")}Registrar revisión`:`${ic("i-x")}No aprobar`;
+  $("#modal-root").innerHTML=`<div class="scrim" id="scrim"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="mt"><h2 id="mt">${tit}</h2><p class="muted" style="margin:0">${txt}</p><label class="lbl" for="motivo">${inc?"Nota del caso":"Motivo"} (obligatorio)</label><textarea id="motivo" placeholder="${inc?"Ej.: confirmado intento de fraude; se notificó al proveedor por el teléfono registrado":"Ej.: el monto no coincide con lo acordado en la OC"}"></textarea><label class="lbl" for="rpin">Tu PIN (${n} dígitos · demo: ${esc(P().pin)})</label><input id="rpin" inputmode="numeric" maxlength="${n}" style="font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);width:120px;letter-spacing:4px"><div id="merr"></div><div class="foot"><span class="sp"></span><button class="btn" id="mcancel">Cancelar</button><button class="btn danger" id="mok" style="background:var(--crit);color:var(--surface);border-color:var(--crit)">${btn}</button></div></div></div>`;
   $("#motivo").focus();
   $("#mcancel").onclick=closeModal;$("#scrim").onclick=e=>{if(e.target.id==="scrim")closeModal();};
   $("#mok").onclick=async()=>{const m=$("#motivo").value.trim();const pin=$("#rpin").value.trim();
-    if(m.length<5){$("#motivo").classList.add("err");$("#merr").innerHTML=`<div class="err-msg">${ic("i-alert")}Escribe un motivo de al menos 5 caracteres.</div>`;return;}
-    try{await api(`/api/solicitudes/${id}/rechazar`,{method:"POST",body:{usuario_id:P().id,pin,motivo:m}});closeModal();toast(`${id} rechazada · quedó en el registro`,"i-x");await cargar();rerender();}
+    if(m.length<5){$("#motivo").classList.add("err");$("#merr").innerHTML=`<div class="err-msg">${ic("i-alert")}Escribe al menos 5 caracteres.</div>`;return;}
+    try{const r=await api(`/api/solicitudes/${id}/${inc?"revisar-incidente":"rechazar"}`,{method:"POST",body:{usuario_id:P().id,pin,motivo:m}});closeModal();toast(inc?esc(r.mensaje):`${id} rechazada · quedó en el registro`,inc?"i-shield":"i-x",5000);await cargar();rerender();}
     catch(err){$("#merr").innerHTML=`<div class="err-msg">${ic("i-alert")}${esc(err.message)}</div>`;}};
 }
 function closeModal(){$("#modal-root").innerHTML="";}

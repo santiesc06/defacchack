@@ -84,7 +84,7 @@ def crear_app(servicio: FirewallService | None = None) -> FastAPI:
         """Resumen del último reporte de evaluacion_empirica.py (reports/resultados*.json)."""
         resumen = resumen_benchmark(ROOT / "reports", svc.pack.id, svc.pack.escenarios())
         if resumen is None:
-            raise HTTPException(404, "Todavía no hay resultados: ejecute evaluacion_empirica.py")
+            raise HTTPException(404, "Todavía no hay resultados del modelo real para este dominio")
         return resumen
 
     @app.get("/api/escenarios/{eid}")

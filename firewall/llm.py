@@ -36,6 +36,9 @@ T = TypeVar("T", bound=BaseModel)
 PROVEEDORES = ("local", "ollama", "groq", "gemini")
 MODELOS_POR_DEFECTO = {"ollama": "qwen2.5:7b", "groq": "llama-3.3-70b-versatile", "gemini": "gemini-2.5-flash"}
 OLLAMA_URL = os.environ.get("CFZT_OLLAMA_URL", "http://127.0.0.1:11434")
+# Contexto de Ollama: los prompts de los agentes caben de sobra en 4096 tokens; un contexto menor deja más VRAM
+# para las capas del modelo (más capas en la GPU = más rápido).
+OLLAMA_NUM_CTX = int(os.environ.get("CFZT_OLLAMA_NUM_CTX", "4096"))
 
 
 def _temperatura() -> float:
@@ -105,7 +108,7 @@ class ProveedorLLM:
             modelos = {m.get("name") for m in tags.get("models", [])} | {m.get("model") for m in tags.get("models", [])}
             if self.modelo not in modelos and f"{self.modelo}:latest" not in modelos:
                 raise RuntimeError(f"el modelo {self.modelo} no está descargado (ejecuta `ollama pull {self.modelo}`)")
-            return ChatOllama(model=self.modelo, temperature=self.temperatura, base_url=OLLAMA_URL, num_ctx=8192)
+            return ChatOllama(model=self.modelo, temperature=self.temperatura, base_url=OLLAMA_URL, num_ctx=OLLAMA_NUM_CTX)
         if self.proveedor == "groq":
             from langchain_groq import ChatGroq  # requirements-llm.txt
             return ChatGroq(model=self.modelo, temperature=self.temperatura)

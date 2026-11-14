@@ -308,6 +308,10 @@ class PackDevOpsCloud(PolicyPack):
         contenido = json.dumps({"solicitud": ext.model_dump(), "titulo_truncado": asunto[:120]}, ensure_ascii=False)
         dec, origen = llm.estructurar("orquestador_devops", contenido, DecisionRelevancia,
                                       lambda: llm_local.decidir_relevancia_cambio(ext, asunto))
+        pide_cambio = dec.categoria == "SOLICITUD_CAMBIO" or ext.es_solicitud_cambio
+        if pide_cambio and not dec.requiere_accion_financiera and ext.recurso and ext.accion:
+            dec = DecisionRelevancia(requiere_accion_financiera=True, categoria="SOLICITUD_CAMBIO",
+                                     justificacion=(dec.justificacion or "Solicitud de cambio concreta")[:300])
         if dec.requiere_accion_financiera and not (ext.recurso and ext.accion):
             dec = DecisionRelevancia(requiere_accion_financiera=False, categoria="INFORMATIVA",
                                      justificacion="Sin recurso ni acción concretos: no requiere al Agente Ejecutor.")

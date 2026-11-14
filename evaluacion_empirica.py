@@ -541,6 +541,8 @@ def main() -> None:
     r = ejecutar(reps, llm, escenarios, a.con_explicador, packs)
 
     sufijo = "" if not llm.es_real else f"_{a.llm}_{llm.modelo.replace(':', '-').replace('/', '-')}"
+    if packs or escenarios:  # corrida parcial: archivo propio, no pisa el reporte completo
+        sufijo += "_" + "-".join(packs or ["escenarios"])
     (ROOT / "reports").mkdir(exist_ok=True)
     (ROOT / "reports" / f"resultados{sufijo}.json").write_text(
         json.dumps(r, indent=2, ensure_ascii=False, default=str), encoding="utf-8")

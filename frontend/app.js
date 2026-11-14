@@ -492,7 +492,6 @@ function vBenchmark(){
          ${bk("Pruebas adversariales al PEP",`${esc(B.pruebas_adversariales||"—")}`,"Firmas falsas, SoD, hash alterado, registro manipulado")}
          ${bk("Latencia añadida",`${C.latencia_control_promedio_ms??"—"} <small>ms por solicitud</small>`,"Costo del control determinista")}
        </div>
-       ${B.n_packs>1&&B.consolidado&&B.consolidado.COMPLETO?`<div class="card" style="grid-template-columns:auto 1fr;align-items:center"><span class="lbl">Todos los dominios (${B.n_packs})</span><span class="mono">Bloqueo de ataques con Sanitizer + PEP: ${pct(B.consolidado.COMPLETO.tasa_bloqueo_ataques_pct)} · sin defensa: ${pct((B.consolidado.SIN_DEFENSA||{}).tasa_bloqueo_ataques_pct)}</span></div>`:""}
      </div>
    </div>
    <div class="bench-bot">
